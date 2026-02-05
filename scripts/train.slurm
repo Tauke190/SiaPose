@@ -36,8 +36,8 @@ cd /home/av354855/projects/sia_pose
 torchrun --nproc_per_node=2 train_pose.py \
        -MODEL sia_pose_simple \
        -COCO_ROOT /mnt/SSD2/coco2017/images \
-       -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
-       -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
+       -TRAIN_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_train2017.json \
+       -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
        --RESUME weights/avak_b16_11.pt \
        -BS 32 -EPOCH 50 -LR 1e-4 --SAVE \
        -WORKERS 8 \
