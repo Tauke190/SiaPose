@@ -40,6 +40,5 @@ torchrun --nproc_per_node=2 train_pose.py \
        -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
        --RESUME weights/avak_b16_11.pt \
        -BS 32 -EPOCH 50 -LR 1e-4 --SAVE \
-       -WORKERS 8 
-       # --NO_TQDM 
-       # --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN pose_rle_experiment
+       -WORKERS 8 \
+       --NO_TQDM --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN pose_rle_experiment
