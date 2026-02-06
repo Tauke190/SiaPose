@@ -681,7 +681,8 @@ class PostProcessPose(nn.Module):
                 keypoints_kept = keypoints_kept[nms_idx]
                 # Zero out low-confidence keypoint visibility
                 keypoints_kept = keypoints_kept.clone()
-                keypoints_kept[keypoints_kept[..., 2] < keypoint_conf, 2] = 0
+                low_conf = keypoints_kept[..., 2] < keypoint_conf
+                keypoints_kept[..., 2][low_conf] = 0
 
             result = {
                 'scores': human_scores_kept,
