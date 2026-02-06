@@ -3,10 +3,9 @@
 #SBATCH --output=ucf_output/slurm-%j.out
 #SBATCH --gres-flags=enforce-binding
 #SBATCH -p gpu
-#SBATCH -C gmem48
 #SBATCH --gres=gpu:2
 #SBATCH --mem-per-cpu=6G 
-#SBATCH --cpus-per-gpu=12
+#SBATCH --cpus-per-gpu=8
 
 
 PORT=$((RANDOM % 55 + 12345))
@@ -40,5 +39,5 @@ torchrun --nproc_per_node=2 train_pose.py \
        -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
        --RESUME weights/avak_b16_11.pt \
        -BS 64 -EPOCH 50 -LR 1e-4 --SAVE \
-       -WORKERS 8 \
+       -WORKERS 8 -EXP sia_pose_simple\
        --NO_TQDM --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN pose_rle_experiment

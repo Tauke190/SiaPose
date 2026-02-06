@@ -215,12 +215,14 @@ def parse_args():
                         help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_decoder_led' (DETR-style LED)")
     parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14'],
                         help="Model size: b16 (ViT-B/16) or l14 (ViT-L/14)")
-    parser.add_argument("-FRAMES", type=int, default=9,
+    parser.add_argument("-FRAMES", type=int, default=1,
                         help="Number of input frames (image duplicated)")
-    parser.add_argument("-DET", type=int, default=20,
+    parser.add_argument("-DET", type=int, default=100,
                         help="Number of detection tokens")
     parser.add_argument("-POSE_LAYERS", type=int, default=2,
                         help="Number of pose decoder layers")
+    parser.add_argument("--FREEZE_BACKBONE", action="store_true",
+                        help="Freeze vision encoder, train only pose heads (use with pretrained weights)")
 
     # Dataset
     parser.add_argument("-COCO_ROOT", type=str, required=True,
@@ -358,10 +360,9 @@ def build_model(args, rank):
         pretrain = "weights/ViCLIP-L_InternVid-FLT-10M.pth"
         size = 'l'
 
-    # Check if pretrain exists, otherwise use None
     if not os.path.exists(pretrain):
-        print(f"Warning: Pretrain weights not found at {pretrain}, training from scratch")
-        pretrain = None
+            print(f"Warning: Pretrain weights not found at {pretrain}, training from scratch")
+            pretrain = None
 
     if args.MODEL == 'sia_pose':
         # Original model with pose decoder
@@ -497,11 +498,30 @@ def count_parameters(model):
 
 
 def build_optimizer(model, args):
-    """Build optimizer with different learning rates for backbone and decoder."""
-    # Only include parameters that require gradients
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    """Build optimizer with separate learning rates for backbone and heads."""
+    if args.FREEZE_BACKBONE:
+        # Backbone frozen — single group of trainable params
+        trainable_params = [p for p in model.parameters() if p.requires_grad]
+        optimizer = torch.optim.AdamW(trainable_params, lr=args.LR, weight_decay=args.WEIGHT_DECAY)
+    else:
+        # Backbone unfrozen — two param groups with different LRs
+        backbone_params = []
+        head_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if ('pose_decoder' in name or 'keypoint' in name or
+                    'led_decoder' in name or 'human_head' in name or
+                    'box_head' in name or 'det_token' in name or
+                    'det_positional' in name):
+                head_params.append(param)
+            else:
+                backbone_params.append(param)
 
-    optimizer = torch.optim.AdamW(trainable_params, lr=args.LR, weight_decay=args.WEIGHT_DECAY)
+        optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': args.LR_BACKBONE},
+            {'params': head_params, 'lr': args.LR},
+        ], weight_decay=args.WEIGHT_DECAY)
 
     return optimizer
 
@@ -768,10 +788,14 @@ def main(args):
         state_dict = torch.load(args.RESUME, map_location='cpu', weights_only=True)
         model.load_state_dict(state_dict, strict=False)
 
-    # Freeze encoder parameters
-    if is_main_process():
-        print("Freezing encoder parameters...", flush=True)
-    freeze_encoder(model)
+    # Freeze encoder parameters if requested
+    if args.FREEZE_BACKBONE:
+        if is_main_process():
+            print("Freezing backbone (vision encoder)...", flush=True)
+        freeze_encoder(model)
+    else:
+        if is_main_process():
+            print("All parameters trainable (backbone unfrozen)", flush=True)
 
     model.to(device)
     if world_size > 1:
@@ -866,7 +890,7 @@ def main(args):
         postprocess = PostProcessPose()
 
     # Create experiment directory
-    exp_dir = os.path.join('weights', args.EXP)
+    exp_dir = os.path.join('output', args.EXP)
     if is_main_process() and not os.path.exists(exp_dir):
         os.makedirs(exp_dir, exist_ok=True)
 

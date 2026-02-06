@@ -26,6 +26,7 @@ var/
 weights/
 extras/
 wandb/
+output/
 
 # Virtual environments
 .venv/
