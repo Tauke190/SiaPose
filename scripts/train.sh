@@ -6,15 +6,15 @@ export PYTHONUNBUFFERED=1
 
 # Multi-GPU training with torchrun (recommended)
 # Adjust --nproc_per_node to match number of GPUs
-torchrun --nproc_per_node=1 --master_port=29501 train_pose.py \
+CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 train_pose.py \
        -MODEL sia_pose_simple \
        -COCO_ROOT /mnt/SSD2/coco2017/images \
        -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
        -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
        -BS 32 -EPOCH 50 -LR 1e-4 --SAVE \
-       -WORKERS 8 
+       --RESUME weights/avak_b16_11.pt \
+       -WORKERS 8  
        # --NO_TQDM 
        # --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN pose_rle_experiment
 
 # CUDA_VISIBLE_DEVICES=2 
-# --RESUME weights/avak_b16_11.pt \

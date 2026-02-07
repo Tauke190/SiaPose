@@ -32,7 +32,7 @@ from sia import (
     get_sia_pose, get_sia_pose_simple, get_sia_pose_decoder_led,
     PostProcessPose, COCO_KEYPOINT_NAMES,
 )
-from datasets import COCOPoseVal
+from datasets import COCOPoseVal, PoseTrackPoseVal
 
 # COCO keypoint sigmas for OKS computation (17 keypoints)
 COCO_SIGMAS = np.array([
@@ -47,6 +47,88 @@ COCO_SIGMAS = np.array([
     0.089, 0.089,           # left_ankle, right_ankle
 ])
 
+# PoseTrack 2017 keypoint names (15 keypoints)
+POSETRACK_KEYPOINT_NAMES = [
+    'nose', 'head_bottom', 'head_top',
+    'left_shoulder', 'right_shoulder',
+    'left_elbow', 'right_elbow',
+    'left_wrist', 'right_wrist',
+    'left_hip', 'right_hip',
+    'left_knee', 'right_knee',
+    'left_ankle', 'right_ankle',
+]
+
+# PoseTrack 2017 sigmas for OKS computation (15 keypoints)
+# Shared keypoints use COCO sigmas; head_bottom/head_top use ear-like sigma
+POSETRACK_SIGMAS = np.array([
+    0.026,                  # nose
+    0.035,                  # head_bottom (approx, similar to ear)
+    0.035,                  # head_top (approx, similar to ear)
+    0.079, 0.079,           # left_shoulder, right_shoulder
+    0.072, 0.072,           # left_elbow, right_elbow
+    0.062, 0.062,           # left_wrist, right_wrist
+    0.107, 0.107,           # left_hip, right_hip
+    0.087, 0.087,           # left_knee, right_knee
+    0.089, 0.089,           # left_ankle, right_ankle
+])
+
+
+def map_coco17_to_posetrack15(pred_kps_17):
+    """Map model's 17 COCO keypoints to PoseTrack's 15 keypoints.
+
+    Direct mapping for 13 shared keypoints (nose + body).
+    Approximates head_bottom (midpoint of shoulders) and head_top
+    (reflection of head_bottom through nose).
+
+    Args:
+        pred_kps_17: numpy array [N, 17, 3] in pixel coords
+
+    Returns:
+        pred_kps_15: numpy array [N, 15, 3] in pixel coords
+    """
+    N = pred_kps_17.shape[0]
+    if N == 0:
+        return np.zeros((0, 15, 3), dtype=pred_kps_17.dtype)
+
+    pred_kps_15 = np.zeros((N, 15, 3), dtype=pred_kps_17.dtype)
+
+    # Direct mappings: PoseTrack idx -> COCO idx
+    direct_map = {
+        0: 0,    # nose
+        3: 5,    # left_shoulder
+        4: 6,    # right_shoulder
+        5: 7,    # left_elbow
+        6: 8,    # right_elbow
+        7: 9,    # left_wrist
+        8: 10,   # right_wrist
+        9: 11,   # left_hip
+        10: 12,  # right_hip
+        11: 13,  # left_knee
+        12: 14,  # right_knee
+        13: 15,  # left_ankle
+        14: 16,  # right_ankle
+    }
+
+    for pt_idx, coco_idx in direct_map.items():
+        pred_kps_15[:, pt_idx] = pred_kps_17[:, coco_idx]
+
+    # Approximate head_bottom as midpoint of shoulders
+    l_shoulder = pred_kps_17[:, 5]  # [N, 3]
+    r_shoulder = pred_kps_17[:, 6]  # [N, 3]
+    head_bottom_xy = (l_shoulder[:, :2] + r_shoulder[:, :2]) / 2
+    head_bottom_vis = np.minimum(l_shoulder[:, 2], r_shoulder[:, 2])
+    pred_kps_15[:, 1, :2] = head_bottom_xy
+    pred_kps_15[:, 1, 2] = head_bottom_vis
+
+    # Approximate head_top: reflect head_bottom through nose
+    nose = pred_kps_17[:, 0]  # [N, 3]
+    head_top_xy = 2 * nose[:, :2] - head_bottom_xy
+    head_top_vis = np.minimum(nose[:, 2], head_bottom_vis)
+    pred_kps_15[:, 2, :2] = head_top_xy
+    pred_kps_15[:, 2, 2] = head_top_vis
+
+    return pred_kps_15
+
 
 # ---------------------------------------------------------------------------
 # Dataset registry — add new datasets here
@@ -60,11 +142,13 @@ def get_dataset(args, transforms):
                  Each target dict must contain at least:
                    - 'image_id': int
                    - 'boxes': Tensor [N, 4] normalised cxcywh
-                   - 'keypoints': Tensor [N, 17, 3] normalised (x, y, vis)
+                   - 'keypoints': Tensor [N, K, 3] normalised (x, y, vis)
         ann_file: path to the annotation JSON (needed for official COCO eval)
         num_keypoints: int
         keypoint_names: list[str]
         sigmas: np.array of keypoint sigmas
+        kp_map_fn: callable or None — maps model's 17-kpt predictions to
+                   dataset keypoints (None when dataset uses 17 COCO kpts)
     """
     name = args.dataset.lower()
 
@@ -84,11 +168,30 @@ def get_dataset(args, transforms):
             frames=args.num_frames,
             min_keypoints=args.min_kp,
         )
-        return dataset, ann_file, 17, COCO_KEYPOINT_NAMES, COCO_SIGMAS
+        return dataset, ann_file, 17, COCO_KEYPOINT_NAMES, COCO_SIGMAS, None
+
+    elif name == 'posetrack':
+        ann_file = args.ann_file
+        if ann_file is None:
+            ann_file = os.path.join(args.data_root, 'jsons',
+                                    'posetrack_val_15kpts.json')
+        img_dir = args.img_dir
+        if img_dir is None:
+            img_dir = os.path.join(args.data_root, 'images')
+
+        dataset = PoseTrackPoseVal(
+            root=img_dir,
+            annFile=ann_file,
+            transforms=transforms,
+            frames=args.num_frames,
+            min_keypoints=args.min_kp,
+        )
+        return (dataset, ann_file, 15, POSETRACK_KEYPOINT_NAMES,
+                POSETRACK_SIGMAS, map_coco17_to_posetrack15)
 
     else:
         raise ValueError(
-            f"Unknown dataset '{name}'. Supported: coco. "
+            f"Unknown dataset '{name}'. Supported: coco, posetrack. "
             "To add a new dataset, extend get_dataset() in val_pose.py."
         )
 
@@ -236,13 +339,15 @@ def compute_ap_oks(all_preds, all_gts, sigmas, oks_thresh=0.5,
 # Official COCO evaluation via pycocotools
 # ---------------------------------------------------------------------------
 
-def run_coco_eval(ann_file, coco_results, output_dir=None):
+def run_coco_eval(ann_file, coco_results, output_dir=None, sigmas=None):
     """Run the official COCO keypoint evaluation.
 
     Args:
         ann_file: path to COCO ground-truth annotation JSON
         coco_results: list of dicts in COCO keypoint result format
         output_dir: if provided, save the results JSON here
+        sigmas: optional np.array of per-keypoint OKS sigmas
+                (overrides pycocotools defaults; needed for non-COCO datasets)
 
     Returns:
         stats dict with AP, AP50, AP75, AR, etc.
@@ -268,6 +373,8 @@ def run_coco_eval(ann_file, coco_results, output_dir=None):
     coco_dt = coco_gt.loadRes(res_path)
 
     coco_eval = COCOeval(coco_gt, coco_dt, 'keypoints')
+    if sigmas is not None:
+        coco_eval.params.kpt_oks_sigmas = sigmas
     coco_eval.evaluate()
     coco_eval.accumulate()
     coco_eval.summarize()
@@ -288,8 +395,14 @@ def collate_fn(batch):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, postprocess, args, sigmas, keypoint_names):
+def evaluate(model, dataloader, postprocess, args, sigmas, keypoint_names,
+             kp_map_fn=None):
     """Run evaluation on the full dataset.
+
+    Args:
+        kp_map_fn: optional callable that maps model's 17 COCO keypoint
+                   predictions [N,17,3] to the dataset's keypoint format
+                   [N,K,3] (e.g. PoseTrack 15 keypoints).
 
     Returns:
         metrics: dict of scalar metrics
@@ -333,6 +446,10 @@ def evaluate(model, dataloader, postprocess, args, sigmas, keypoint_names):
             pred_boxes = result['boxes'].cpu().numpy().astype(float)
             pred_kps = result['keypoints'].cpu().numpy().astype(float)
             pred_scores = result['scores'].cpu().numpy().astype(float)
+
+            # Map model keypoints to dataset keypoints if needed
+            if kp_map_fn is not None and len(pred_kps) > 0:
+                pred_kps = kp_map_fn(pred_kps)
 
             all_preds.append({
                 'boxes': pred_boxes,
@@ -477,7 +594,7 @@ def parse_args():
 
     # Dataset
     p.add_argument('--dataset', type=str, default='coco',
-                   help='Dataset name (coco)')
+                   help='Dataset name (coco, posetrack)')
     p.add_argument('--data_root', type=str, default=None,
                    help='Dataset root directory')
     p.add_argument('--img_dir', type=str, default=None,
@@ -552,7 +669,7 @@ def main():
         v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
     ])
 
-    dataset, ann_file, num_kp, kp_names, sigmas = get_dataset(args, transforms)
+    dataset, ann_file, num_kp, kp_names, sigmas, kp_map_fn = get_dataset(args, transforms)
     dataloader = DataLoader(
         dataset,
         batch_size=args.batch_size,
@@ -568,6 +685,7 @@ def main():
     postprocess = PostProcessPose()
     metrics, coco_results, all_preds, all_gts = evaluate(
         model, dataloader, postprocess, args, sigmas, kp_names,
+        kp_map_fn=kp_map_fn,
     )
 
     # Print custom metrics
@@ -594,7 +712,8 @@ def main():
         print(f"\n{'='*60}")
         print("Official COCO Evaluation (pycocotools)")
         print(f"{'='*60}")
-        coco_stats = run_coco_eval(ann_file, coco_results, args.output_dir)
+        coco_stats = run_coco_eval(ann_file, coco_results, args.output_dir,
+                                   sigmas=sigmas)
         metrics['coco_eval'] = coco_stats
 
     # Save results

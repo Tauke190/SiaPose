@@ -1,16 +1,17 @@
-# Encoder (ViT-B/16, frozen)
+# Encoder (ViT)
 #     ↓
-# 100 Detection Tokens [B, 100, 768]
+# 100 Detection Tokens [B, 100, D]  →  detection heads (bbox, human, class)
+# 100 Pose Tokens [B, 100, D]       →  keypoint regression
 #     ↓
-# keypoint_proj [768 → 13056]
+# keypoint_proj [D → 17*D]
 #     ↓
-# Reshape to [B, 100, 17, 768]  (17 keypoints per detection)
+# Reshape to [B, 100, 17, D]  (17 keypoints per pose token)
 #     ↓
 # ┌─────────────────────────────────────┐
-# │ For each keypoint embedding (768-D) │
+# │ For each keypoint embedding (D-dim) │
 # ├─────────────────────────────────────┤
-# │ xy_head: 768→768→768→2  (x,y coords)│
-# │ vis_head: 768→384→1     (visibility)│
+# │ xy_head: D→D→D→2  (x,y coords)     │
+# │ vis_head: D→D/2→1  (visibility)     │
 # └─────────────────────────────────────┘
 #     ↓
 # Output: [B, 100, 17, 3]  (x, y, visibility per keypoint)
@@ -75,8 +76,18 @@ class VisionTransformerSimple(VisionTransformer):
         self.num_keypoints = num_keypoints
         self.enable_simple_pose = True
 
-        # Simple keypoint embedding per detection token
-        # Projects det_token -> num_keypoints features
+        # Dedicated pose tokens (randomly initialized, separate from det tokens)
+        # These go through the encoder alongside det tokens but specialize for keypoints
+        self.pose_token_num = det_token_num  # must match det_token_num for Hungarian matching
+        self.pose_token = nn.Parameter(torch.zeros(self.pose_token_num, width))
+        nn.init.normal_(self.pose_token, std=0.02)
+        self.pose_positional_embedding = nn.Parameter(
+            (width ** -0.5) * torch.randn(self.pose_token_num, width)
+        )
+        nn.init.normal_(self.pose_positional_embedding, std=0.02)
+
+        # Simple keypoint embedding per pose token
+        # Projects pose_token -> num_keypoints features
         self.keypoint_proj = nn.Linear(width, num_keypoints * width)
 
         # Keypoint prediction heads (same as original)
@@ -119,22 +130,31 @@ class VisionTransformerSimple(VisionTransformer):
         if masking_prob > 0.0:
             x = self.mask_tokens(x, masking_prob)
 
-        # [DET] Tokens
+        # [DET] Tokens (for detection heads)
         if self.det_token_num > 0:
             det_tokens = self.det_token + self.det_positional_embedding
-            det_tokens = det_tokens + torch.zeros(B, det_tokens.shape[0], det_tokens.shape[1]).to(det_tokens.device)
+            det_tokens = det_tokens.unsqueeze(0).expand(B, -1, -1)
             x = torch.cat((x, det_tokens), dim=1)
+
+        # [POSE] Tokens (for keypoint regression, randomly initialized)
+        pose_tokens = self.pose_token + self.pose_positional_embedding
+        pose_tokens = pose_tokens.unsqueeze(0).expand(B, -1, -1)
+        x = torch.cat((x, pose_tokens), dim=1)
 
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # BND -> NBD
         x = self.transformer(x)
         x = self.ln_post(x)
 
-        # Split spatial and detection tokens
+        # Split spatial, detection, and pose tokens
+        # Sequence order: [spatial..., det_tokens..., pose_tokens...]
+        # x shape: [N, B, D] where N = spatial + det_token_num + pose_token_num
+        pose_x = self.dropout(x[-self.pose_token_num:]).permute(1, 0, 2)  # [B, pose_token_num, D]
+
         if self.det_token_num > 0:
-            det_x = self.dropout(x[-self.det_token_num:]).permute(1, 0, 2)  # [B, det_token_num, D]
+            det_x = self.dropout(x[-(self.det_token_num + self.pose_token_num):-self.pose_token_num]).permute(1, 0, 2)  # [B, det_token_num, D]
         else:
-            det_x = self.dropout(x.reshape(H*W, T, B, C).mean(1)).permute(1, 0, 2)
+            det_x = self.dropout(x[:-self.pose_token_num].reshape(H*W, T, B, C).mean(1)).permute(1, 0, 2)
 
         # Standard output heads (no LoRA)
         if self.proj is not None:
@@ -148,13 +168,13 @@ class VisionTransformerSimple(VisionTransformer):
 
         out = {'pred_logits': class_scores, 'pred_boxes': bboxes, 'human_logits': human_scores}
 
-        # Simple keypoint prediction (no decoder, direct from det_x)
-        if self.enable_simple_pose and self.det_token_num > 0:
-            B_kp, num_det, D = det_x.shape
+        # Simple keypoint prediction (from dedicated pose tokens)
+        if self.enable_simple_pose:
+            B_kp, num_det, D = pose_x.shape
 
-            # Project detection tokens to keypoint features
+            # Project pose tokens to keypoint features
             # [B, num_det, D] -> [B, num_det, num_keypoints * D]
-            kp_features = self.keypoint_proj(det_x)
+            kp_features = self.keypoint_proj(pose_x)
             # Reshape to [B, num_det, num_keypoints, D]
             kp_features = kp_features.view(B_kp, num_det, self.num_keypoints, D)
 

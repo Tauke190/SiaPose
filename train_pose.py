@@ -215,9 +215,9 @@ def parse_args():
                         help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_decoder_led' (DETR-style LED)")
     parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14'],
                         help="Model size: b16 (ViT-B/16) or l14 (ViT-L/14)")
-    parser.add_argument("-FRAMES", type=int, default=1,
+    parser.add_argument("-FRAMES", type=int, default=9,
                         help="Number of input frames (image duplicated)")
-    parser.add_argument("-DET", type=int, default=100,
+    parser.add_argument("-DET", type=int, default=20,
                         help="Number of detection tokens")
     parser.add_argument("-POSE_LAYERS", type=int, default=2,
                         help="Number of pose decoder layers")
@@ -437,8 +437,8 @@ def freeze_encoder(model):
     trainable_count = 0
 
     for name, param in model.named_parameters():
-        # Keep pose decoder and keypoint-related parameters trainable
-        if 'pose_decoder' in name or 'keypoint' in name:
+        # Keep pose decoder, keypoint heads, and pose tokens trainable
+        if 'pose_decoder' in name or 'keypoint' in name or 'pose_token' in name or 'pose_positional' in name:
             param.requires_grad = True
             trainable_count += param.numel()
         else:
