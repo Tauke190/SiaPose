@@ -73,6 +73,18 @@ POSETRACK_SIGMAS = np.array([
 ])
 
 
+def compute_iou(box1, box2):
+    """IoU between two xyxy boxes."""
+    x1 = max(box1[0], box2[0])
+    y1 = max(box1[1], box2[1])
+    x2 = min(box1[2], box2[2])
+    y2 = min(box1[3], box2[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
+    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
+    return inter / (area1 + area2 - inter + 1e-8)
+
+
 def map_coco17_to_posetrack15(pred_kps_17):
     """Map model's 17 COCO keypoints to PoseTrack's 15 keypoints.
 
@@ -235,107 +247,6 @@ def build_model(args):
 
 
 # ---------------------------------------------------------------------------
-# OKS helpers (custom, for per-keypoint breakdown)
-# ---------------------------------------------------------------------------
-
-def compute_oks(pred_kp, gt_kp, gt_area, sigmas):
-    """Compute OKS between a single prediction and ground truth."""
-    vis_mask = gt_kp[:, 2] > 0
-    if vis_mask.sum() == 0:
-        return 0.0
-
-    dx = pred_kp[:, 0] - gt_kp[:, 0]
-    dy = pred_kp[:, 1] - gt_kp[:, 1]
-    d_sq = dx ** 2 + dy ** 2
-
-    vars_ = (sigmas * 2) ** 2
-    exp_terms = np.exp(-d_sq / (2 * gt_area * vars_ + 1e-8))
-    return float(np.sum(exp_terms * vis_mask) / np.sum(vis_mask))
-
-
-def compute_per_keypoint_accuracy(pred_kp, gt_kp, gt_area, sigmas,
-                                  oks_thresh=0.5):
-    """Return a boolean array [num_keypoints] indicating correct keypoints."""
-    vars_ = (sigmas * 2) ** 2
-    dx = pred_kp[:, 0] - gt_kp[:, 0]
-    dy = pred_kp[:, 1] - gt_kp[:, 1]
-    d_sq = dx ** 2 + dy ** 2
-    per_kp_oks = np.exp(-d_sq / (2 * gt_area * vars_ + 1e-8))
-    return per_kp_oks >= oks_thresh
-
-
-def compute_iou(box1, box2):
-    """IoU between two xyxy boxes."""
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    return inter / (area1 + area2 - inter + 1e-8)
-
-
-def compute_ap_oks(all_preds, all_gts, sigmas, oks_thresh=0.5,
-                   iou_thresh=0.5):
-    """Compute AP at a given OKS threshold (custom implementation)."""
-    all_detections = []
-    total_gt = 0
-
-    for preds, gts in zip(all_preds, all_gts):
-        num_gt = len(gts['boxes'])
-        total_gt += num_gt
-        if num_gt == 0:
-            for s in preds['scores']:
-                all_detections.append((s, False))
-            continue
-        if len(preds['boxes']) == 0:
-            continue
-
-        gt_matched = [False] * num_gt
-        order = np.argsort(-preds['scores'])
-
-        for pi in order:
-            best_oks, best_gi = 0.0, -1
-            for gi in range(num_gt):
-                if gt_matched[gi]:
-                    continue
-                iou = compute_iou(preds['boxes'][pi], gts['boxes'][gi])
-                if iou < iou_thresh:
-                    continue
-                oks = compute_oks(preds['keypoints'][pi], gts['keypoints'][gi],
-                                  gts['areas'][gi], sigmas)
-                if oks > best_oks:
-                    best_oks = oks
-                    best_gi = gi
-            is_tp = best_oks >= oks_thresh and best_gi >= 0
-            if is_tp:
-                gt_matched[best_gi] = True
-            all_detections.append((preds['scores'][pi], is_tp))
-
-    if total_gt == 0 or len(all_detections) == 0:
-        return 0.0
-
-    all_detections.sort(key=lambda x: -x[0])
-    tp, fp = 0, 0
-    precs, recs = [], []
-    for _, is_tp in all_detections:
-        if is_tp:
-            tp += 1
-        else:
-            fp += 1
-        precs.append(tp / (tp + fp))
-        recs.append(tp / total_gt)
-
-    # 101-pt interpolation (COCO style)
-    ap = 0.0
-    for t in np.linspace(0, 1, 101):
-        p = max((pr for pr, rc in zip(precs, recs) if rc >= t), default=0.0)
-        ap += p / 101
-    return ap
-
-
-# ---------------------------------------------------------------------------
 # Official COCO evaluation via pycocotools
 # ---------------------------------------------------------------------------
 
@@ -395,9 +306,9 @@ def collate_fn(batch):
 
 
 @torch.no_grad()
-def evaluate(model, dataloader, postprocess, args, sigmas, keypoint_names,
+def evaluate(model, dataloader, postprocess, args, num_keypoints,
              kp_map_fn=None):
-    """Run evaluation on the full dataset.
+    """Run inference and collect predictions in COCO result format.
 
     Args:
         kp_map_fn: optional callable that maps model's 17 COCO keypoint
@@ -405,22 +316,15 @@ def evaluate(model, dataloader, postprocess, args, sigmas, keypoint_names,
                    [N,K,3] (e.g. PoseTrack 15 keypoints).
 
     Returns:
-        metrics: dict of scalar metrics
         coco_results: list of COCO-format result dicts
-        all_preds / all_gts: raw per-image predictions and ground truths
+        num_images: number of images evaluated
+        total_inference_time: total model forward-pass time in seconds
     """
     model.eval()
     device = next(model.parameters()).device
     imgsize = (args.height, args.width)
 
-    all_preds, all_gts = [], []
     coco_results = []
-    num_keypoints = len(sigmas)
-
-    # Per-keypoint trackers
-    kp_correct = np.zeros(num_keypoints)
-    kp_total = np.zeros(num_keypoints)
-
     total_inference_time = 0.0
     num_images = 0
 
@@ -442,129 +346,40 @@ def evaluate(model, dataloader, postprocess, args, sigmas, keypoint_names,
             image_id = int(target['image_id'])
             num_images += 1
 
-            # --- predictions in pixel coords ---
             pred_boxes = result['boxes'].cpu().numpy().astype(float)
             pred_kps = result['keypoints'].cpu().numpy().astype(float)
             pred_scores = result['scores'].cpu().numpy().astype(float)
 
-            # Map model keypoints to dataset keypoints if needed
             if kp_map_fn is not None and len(pred_kps) > 0:
                 pred_kps = kp_map_fn(pred_kps)
 
-            all_preds.append({
-                'boxes': pred_boxes,
-                'keypoints': pred_kps,
-                'scores': pred_scores,
-            })
+            # Rescale from resized coords to original image coords
+            orig_h, orig_w = target['orig_size'].tolist()
+            scale_x = orig_w / imgsize[1]
+            scale_y = orig_h / imgsize[0]
 
-            # --- ground truth: normalised → pixel ---
-            gt_boxes_norm = target['boxes'].cpu().numpy()
-            gt_kps_norm = target['keypoints'].cpu().numpy()
-
-            gt_boxes_px, gt_areas = [], []
-            for box in gt_boxes_norm:
-                cx, cy, w, h = box
-                x1 = (cx - w / 2) * imgsize[1]
-                y1 = (cy - h / 2) * imgsize[0]
-                x2 = (cx + w / 2) * imgsize[1]
-                y2 = (cy + h / 2) * imgsize[0]
-                gt_boxes_px.append([x1, y1, x2, y2])
-                gt_areas.append(w * imgsize[1] * h * imgsize[0])
-
-            gt_boxes_px = np.array(gt_boxes_px) if gt_boxes_px else np.zeros((0, 4))
-            gt_areas = np.array(gt_areas) if gt_areas else np.zeros(0)
-
-            gt_kps_px = gt_kps_norm.copy()
-            if len(gt_kps_px) > 0:
-                gt_kps_px[:, :, 0] *= imgsize[1]
-                gt_kps_px[:, :, 1] *= imgsize[0]
-
-            all_gts.append({
-                'boxes': gt_boxes_px,
-                'keypoints': gt_kps_px,
-                'areas': gt_areas,
-            })
-
-            # --- per-keypoint accuracy (matched by IoU) ---
-            if len(pred_boxes) > 0 and len(gt_boxes_px) > 0:
-                gt_matched = [False] * len(gt_boxes_px)
-                order = np.argsort(-pred_scores)
-                for pi in order:
-                    best_gi = -1
-                    best_iou = 0.5  # threshold
-                    for gi in range(len(gt_boxes_px)):
-                        if gt_matched[gi]:
-                            continue
-                        iou = compute_iou(pred_boxes[pi], gt_boxes_px[gi])
-                        if iou > best_iou:
-                            best_iou = iou
-                            best_gi = gi
-                    if best_gi >= 0:
-                        gt_matched[best_gi] = True
-                        vis_mask = gt_kps_px[best_gi][:, 2] > 0
-                        correct = compute_per_keypoint_accuracy(
-                            pred_kps[pi], gt_kps_px[best_gi],
-                            gt_areas[best_gi], sigmas)
-                        kp_correct += correct * vis_mask
-                        kp_total += vis_mask
-
-            # --- build COCO results (for official eval) ---
             for pi in range(len(pred_boxes)):
                 box = pred_boxes[pi]
                 kps = pred_kps[pi]
-                # COCO expects keypoints as [x1,y1,v1,...,x17,y17,v17]
                 kps_flat = []
                 for ki in range(num_keypoints):
                     kps_flat.extend([
-                        float(kps[ki, 0]),
-                        float(kps[ki, 1]),
-                        # COCO visibility: 0=not labeled, 1=labeled not visible, 2=labeled visible
+                        float(kps[ki, 0]) * scale_x,
+                        float(kps[ki, 1]) * scale_y,
                         2 if float(kps[ki, 2]) > args.kp_conf_thresh else 1,
                     ])
                 coco_results.append({
                     'image_id': image_id,
-                    'category_id': 1,  # person
+                    'category_id': 1,
                     'keypoints': kps_flat,
                     'score': float(pred_scores[pi]),
                     'bbox': [
-                        float(box[0]), float(box[1]),
-                        float(box[2] - box[0]), float(box[3] - box[1]),
-                    ],  # xywh
+                        float(box[0]) * scale_x, float(box[1]) * scale_y,
+                        float(box[2] - box[0]) * scale_x, float(box[3] - box[1]) * scale_y,
+                    ],
                 })
 
-    # --- aggregate metrics ---
-    total_gt = sum(len(g['boxes']) for g in all_gts)
-    total_det = sum(len(p['boxes']) for p in all_preds)
-    fps = num_images / total_inference_time if total_inference_time > 0 else 0
-
-    # Custom AP at different OKS thresholds
-    ap50 = compute_ap_oks(all_preds, all_gts, sigmas, oks_thresh=0.5)
-    ap75 = compute_ap_oks(all_preds, all_gts, sigmas, oks_thresh=0.75)
-
-    # AP averaged over thresholds 0.50:0.05:0.95 (COCO style)
-    oks_thresholds = np.arange(0.50, 1.00, 0.05)
-    ap_per_thresh = [compute_ap_oks(all_preds, all_gts, sigmas, t)
-                     for t in oks_thresholds]
-    ap_mean = float(np.mean(ap_per_thresh))
-
-    # Per-keypoint accuracy
-    kp_acc = {}
-    for ki in range(num_keypoints):
-        acc = kp_correct[ki] / max(kp_total[ki], 1)
-        kp_acc[keypoint_names[ki]] = float(acc)
-
-    metrics = {
-        'num_images': num_images,
-        'total_gt': total_gt,
-        'total_detections': total_det,
-        'fps': round(fps, 1),
-        'custom_AP': round(ap_mean, 4),
-        'custom_AP50': round(ap50, 4),
-        'custom_AP75': round(ap75, 4),
-        'per_keypoint_accuracy': kp_acc,
-    }
-
-    return metrics, coco_results, all_preds, all_gts
+    return coco_results, num_images, total_inference_time
 
 
 # ---------------------------------------------------------------------------
@@ -585,11 +400,11 @@ def parse_args():
                    help='Model architecture')
     p.add_argument('--size', type=str, default='b16', choices=['b16', 'l14'],
                    help='Model size')
-    p.add_argument('--det_tokens', type=int, default=100,
+    p.add_argument('--det_tokens', type=int, default=20,
                    help='Number of detection tokens')
     p.add_argument('--pose_layers', type=int, default=2,
                    help='Number of pose decoder layers')
-    p.add_argument('--num_frames', type=int, default=1,
+    p.add_argument('--num_frames', type=int, default=9,
                    help='Number of input frames (image duplicated)')
 
     # Dataset
@@ -622,8 +437,7 @@ def parse_args():
     # Output
     p.add_argument('--output_dir', type=str, default=None,
                    help='Directory to save results JSON and metrics')
-    p.add_argument('--no_coco_eval', action='store_true',
-                   help='Skip official COCO evaluation (pycocotools)')
+
 
     return p.parse_args()
 
@@ -680,41 +494,30 @@ def main():
     )
     print(f"      {len(dataset)} images, {num_kp} keypoints")
 
-    # Run evaluation
-    print("\n[3/4] Running evaluation...")
+    # Run inference
+    print("\n[3/4] Running inference...")
     postprocess = PostProcessPose()
-    metrics, coco_results, all_preds, all_gts = evaluate(
-        model, dataloader, postprocess, args, sigmas, kp_names,
+    coco_results, num_images, inference_time = evaluate(
+        model, dataloader, postprocess, args, num_kp,
         kp_map_fn=kp_map_fn,
     )
 
-    # Print custom metrics
+    fps = num_images / inference_time if inference_time > 0 else 0
+    print(f"      {num_images} images, {len(coco_results)} detections, {fps:.1f} img/s")
+
+    # Official COCO evaluation
     print(f"\n{'='*60}")
-    print("Custom Metrics (computed internally)")
+    print("COCO Evaluation (pycocotools)")
     print(f"{'='*60}")
-    print(f"  Images evaluated  : {metrics['num_images']}")
-    print(f"  Total GT persons  : {metrics['total_gt']}")
-    print(f"  Total detections  : {metrics['total_detections']}")
-    print(f"  Inference speed   : {metrics['fps']:.1f} img/s")
-    print(f"  AP  (OKS 0.50:0.95) : {metrics['custom_AP']:.4f}")
-    print(f"  AP50 (OKS 0.50)     : {metrics['custom_AP50']:.4f}")
-    print(f"  AP75 (OKS 0.75)     : {metrics['custom_AP75']:.4f}")
+    coco_stats = run_coco_eval(ann_file, coco_results, args.output_dir,
+                               sigmas=sigmas)
 
-    print(f"\n  Per-Keypoint Accuracy (OKS >= 0.5):")
-    print(f"  {'Keypoint':<20} {'Accuracy':>8}")
-    print(f"  {'-'*30}")
-    for kp_name, acc in metrics['per_keypoint_accuracy'].items():
-        print(f"  {kp_name:<20} {acc:>8.4f}")
-
-    # Official COCO eval
-    coco_stats = {}
-    if not args.no_coco_eval and ann_file is not None:
-        print(f"\n{'='*60}")
-        print("Official COCO Evaluation (pycocotools)")
-        print(f"{'='*60}")
-        coco_stats = run_coco_eval(ann_file, coco_results, args.output_dir,
-                                   sigmas=sigmas)
-        metrics['coco_eval'] = coco_stats
+    metrics = {
+        'num_images': num_images,
+        'total_detections': len(coco_results),
+        'fps': round(fps, 1),
+        **coco_stats,
+    }
 
     # Save results
     if args.output_dir:

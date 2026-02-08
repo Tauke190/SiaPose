@@ -141,50 +141,7 @@ class PoseDecoder(nn.Module):
 class QuickGELU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(1.702 * x)
-    
-# PeFT: Added LoRA    
-class LoRALayer(torch.nn.Module):
-    def __init__(self, in_dim, out_dim, rank=8, alpha=16):
-        super().__init__()
-        std_dev = 1 / torch.sqrt(torch.tensor(rank).float())
-        self.A = torch.nn.Parameter(torch.randn(in_dim, rank) * std_dev)
-        self.B = torch.nn.Parameter(torch.zeros(rank, out_dim))
-        self.alpha = alpha
-
-    def forward(self, x):
-        x = self.alpha * (x @ self.A @ self.B)
-        return x
-
-class TransformerMLPwithLoRA(nn.Module):
-    def __init__(self, d_model, dropout=0., det_token_num=0):
-        super().__init__()
-        self.c_fc = nn.Linear(d_model, d_model * 4)
-        self.gelu = QuickGELU()
-        self.drop1 = nn.Dropout(dropout)
-        self.c_proj = nn.Linear(d_model * 4, d_model)
-        self.drop2 = nn.Dropout(dropout)
-        
-        self.det_token_num = det_token_num
-        self.det_lora_fc = LoRALayer(d_model, d_model * 4)
-        self.det_lora_proj = LoRALayer(d_model * 4, d_model)
-        
-    def forward(self, x):
-        x, x_det = x[:-self.det_token_num], x[-self.det_token_num:]
-        x = self.c_fc(x)
-        x = self.gelu(x)
-        x = self.drop1(x)
-        x = self.c_proj(x)
-        x = self.drop2(x)
-        
-        x_det = self.c_fc(x_det) + self.det_lora_fc(x_det)
-        x_det = self.gelu(x_det)
-        x_det = self.drop1(x_det)
-        x_det = self.c_proj(x_det) + self.det_lora_proj(x_det)
-        x_det = self.drop2(x_det)
-        
-        x = torch.cat([x, x_det], dim=0)
-        
-        return x
+ 
 
 class TransformerMLP(nn.Module):
     def __init__(self, d_model, dropout=0.):
@@ -204,7 +161,7 @@ class TransformerMLP(nn.Module):
         return x
         
 class ResidualAttentionBlock(nn.Module):
-    def __init__(self, d_model, n_head, drop_path=0., dropout=0., det_token_num=100, lora=False):
+    def __init__(self, d_model, n_head, drop_path=0., dropout=0., det_token_num=100):
         super().__init__()
 
         self.drop_path1 = DropPath(drop_path) if drop_path > 0. else nn.Identity()
@@ -212,10 +169,8 @@ class ResidualAttentionBlock(nn.Module):
         # logger.info(f'Droppath: {drop_path}')
         self.attn = nn.MultiheadAttention(d_model, n_head, dropout=dropout)
         self.ln_1 = nn.LayerNorm(d_model)
-        if lora and det_token_num > 0:
-            self.mlp = TransformerMLPwithLoRA(d_model, dropout, det_token_num)
-        else:
-            self.mlp = TransformerMLP(d_model, dropout)
+   
+        self.mlp = TransformerMLP(d_model, dropout)
         self.ln_2 = nn.LayerNorm(d_model)
         self.det_token_num = det_token_num
 
@@ -228,7 +183,7 @@ class ResidualAttentionBlock(nn.Module):
         return x
 
 class Transformer(nn.Module):
-    def __init__(self, width, layers, heads, drop_path=0., checkpoint_num=0, dropout=0., det_token_num=100, lora=False, num_frames=9):
+    def __init__(self, width, layers, heads, drop_path=0., checkpoint_num=0, dropout=0., det_token_num=100, num_frames=9):
         super().__init__()
         dpr = [x.item() for x in torch.linspace(0, drop_path, layers)]
         self.resblocks = nn.ModuleList()
@@ -238,8 +193,7 @@ class Transformer(nn.Module):
                                                          heads,
                                                          drop_path=dpr[idx],
                                                          dropout=dropout,
-                                                         det_token_num=det_token_num,
-                                                         lora=lora))
+                                                         det_token_num=det_token_num))
         self.checkpoint_num = checkpoint_num
 
     def forward(self, x):
@@ -254,8 +208,7 @@ class VisionTransformer(nn.Module):
     def __init__(
         self, input_resolution, patch_size, width, layers, heads, output_dim=None,
         kernel_size=1, num_frames=9, drop_path=0, checkpoint_num=0, dropout=0.,
-        temp_embed=True, det_token_num=100, lora=False,
-        # Pose detection parameters
+        temp_embed=True, det_token_num=100,
         num_keypoints=17, pose_decoder_layers=2, enable_pose=True,
     ):
         super().__init__()
@@ -277,16 +230,13 @@ class VisionTransformer(nn.Module):
         if temp_embed:
             self.temporal_positional_embedding = nn.Parameter(torch.zeros(1, num_frames, width))
 
-        self.lora = lora
         self.transformer = Transformer(
             width, layers, heads, drop_path=drop_path, checkpoint_num=checkpoint_num,
-            dropout=dropout, det_token_num=det_token_num, lora=self.lora, num_frames=num_frames)
+            dropout=dropout, det_token_num=det_token_num, num_frames=num_frames)
 
         self.ln_post = nn.LayerNorm(width)
         if output_dim is not None:
             self.proj = nn.Parameter(torch.empty(width, output_dim))
-            if self.lora:
-                self.det_proj_lora = LoRALayer(width, output_dim)
         else:
             self.proj = None # Action logits MLP
 
@@ -451,8 +401,6 @@ class VisionTransformer(nn.Module):
         # ============================================================================
         if self.proj is not None:
             class_scores = det_for_heads @ self.proj
-            if self.lora:
-                class_scores += self.det_proj_lora(det_for_heads)
         else:
             class_scores = det_for_heads
 
@@ -534,7 +482,6 @@ def clip_joint_b16(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
     dropout=0.,
-    lora=False,
     # Pose detection parameters
     num_keypoints=17, pose_decoder_layers=2, enable_pose=True,
 ):
@@ -544,7 +491,6 @@ def clip_joint_b16(
         kernel_size=kernel_size, num_frames=num_frames,
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
-        lora=lora,
         # Pose detection
         num_keypoints=num_keypoints, pose_decoder_layers=pose_decoder_layers, enable_pose=enable_pose,
     )
@@ -565,7 +511,6 @@ def clip_joint_l14(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
     dropout=0.,
-    lora=False,
     # Pose detection parameters
     num_keypoints=17, pose_decoder_layers=2, enable_pose=True,
 ):
@@ -575,7 +520,6 @@ def clip_joint_l14(
         kernel_size=kernel_size, num_frames=num_frames,
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
-        lora=lora,
         # Pose detection
         num_keypoints=num_keypoints, pose_decoder_layers=pose_decoder_layers, enable_pose=enable_pose,
     )

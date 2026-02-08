@@ -42,8 +42,7 @@ class VisionTransformerSimple(VisionTransformer):
     """
     Vision Transformer without pose decoder.
 
-    Keypoints are predicted directly from detection tokens without
-    cross-attention refinement to spatial features.
+    Keypoints are predicted directly from pose tokens.
     """
     def __init__(
         self, input_resolution, patch_size, width, layers, heads, output_dim=None,
@@ -51,7 +50,6 @@ class VisionTransformerSimple(VisionTransformer):
         temp_embed=True, det_token_num=100,
         num_keypoints=17,
     ):
-        # Initialize parent WITHOUT pose decoder and WITHOUT lora
         super().__init__(
             input_resolution=input_resolution,
             patch_size=patch_size,
@@ -66,7 +64,6 @@ class VisionTransformerSimple(VisionTransformer):
             dropout=dropout,
             temp_embed=temp_embed,
             det_token_num=det_token_num,
-            lora=False,  # No LoRA in simple model
             num_keypoints=num_keypoints,
             pose_decoder_layers=0,  # No decoder layers
             enable_pose=False,  # Disable parent's pose handling
@@ -202,7 +199,7 @@ def clip_joint_b16_simple(
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
     dropout=0., num_keypoints=17,
 ):
-    """ViT-B/16 without pose decoder (no LoRA)."""
+    """ViT-B/16"""
     model = VisionTransformerSimple(
         input_resolution=input_resolution, patch_size=16,
         width=768, layers=12, heads=12, output_dim=512,
@@ -224,7 +221,7 @@ def clip_joint_l14_simple(
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
     dropout=0., num_keypoints=17,
 ):
-    """ViT-L/14 without pose decoder (no LoRA)."""
+    """ViT-L/14"""
     model = VisionTransformerSimple(
         input_resolution=input_resolution, patch_size=14,
         width=1024, layers=24, heads=16, output_dim=768,

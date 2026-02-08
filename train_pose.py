@@ -45,166 +45,37 @@ COCO_SIGMAS = np.array([
 ])
 
 
-def compute_oks(pred_kp, gt_kp, gt_area):
-    """Compute Object Keypoint Similarity between predicted and ground truth keypoints.
-
-    Args:
-        pred_kp: Predicted keypoints [num_keypoints, 3] (x, y, vis) - pixel coordinates
-        gt_kp: Ground truth keypoints [num_keypoints, 3] (x, y, vis) - pixel coordinates
-        gt_area: Ground truth bounding box area (in pixels)
+def run_coco_eval(ann_file, coco_results, sigmas=None):
+    """Run the official COCO keypoint evaluation via pycocotools.
 
     Returns:
-        OKS score in [0, 1]
+        stats dict with AP, AP50, AP75, AR, etc.
     """
-    # Get visibility mask from ground truth (vis > 0 means labeled)
-    vis_mask = gt_kp[:, 2] > 0
+    from pycocotools.coco import COCO
+    from pycocotools.cocoeval import COCOeval
 
-    if vis_mask.sum() == 0:
-        return 0.0
+    if len(coco_results) == 0:
+        print("No predictions to evaluate.")
+        return {}
 
-    # Compute squared distances for visible keypoints
-    dx = pred_kp[:, 0] - gt_kp[:, 0]
-    dy = pred_kp[:, 1] - gt_kp[:, 1]
-    d_squared = dx ** 2 + dy ** 2
+    res_path = '/tmp/sia_pose_train_coco_results.json'
+    with open(res_path, 'w') as f:
+        json.dump(coco_results, f)
 
-    # Scale factor: s^2 = area, so we use area directly
-    # OKS uses k^2 * 2 * s^2 as the denominator variance
-    s_squared = gt_area
-    vars = (COCO_SIGMAS * 2) ** 2
+    coco_gt = COCO(ann_file)
+    coco_dt = coco_gt.loadRes(res_path)
 
-    # Compute OKS: sum of exp(-d^2 / (2 * s^2 * k^2)) for visible keypoints
-    exp_terms = np.exp(-d_squared / (2 * s_squared * vars + 1e-8))
+    coco_eval = COCOeval(coco_gt, coco_dt, 'keypoints')
+    if sigmas is not None:
+        coco_eval.params.kpt_oks_sigmas = sigmas
+    coco_eval.evaluate()
+    coco_eval.accumulate()
+    coco_eval.summarize()
 
-    # Only count visible keypoints
-    oks = np.sum(exp_terms * vis_mask) / np.sum(vis_mask)
-
-    return oks
-
-
-def compute_iou(box1, box2):
-    """Compute IoU between two boxes in xyxy format."""
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    union = area1 + area2 - inter
-
-    return inter / (union + 1e-8)
-
-
-def compute_ap_oks(all_predictions, all_targets, oks_threshold=0.5, iou_threshold=0.5):
-    """Compute Average Precision at a given OKS threshold.
-
-    Args:
-        all_predictions: List of dicts with 'boxes', 'keypoints', 'scores' (pixel coords)
-        all_targets: List of dicts with 'boxes', 'keypoints', 'area' (pixel coords)
-        oks_threshold: OKS threshold for true positive
-        iou_threshold: IoU threshold for box matching
-
-    Returns:
-        AP score
-    """
-    # Collect all predictions with their scores and match info
-    all_detections = []  # (score, is_tp, oks)
-    total_gt = 0
-
-    for preds, targets in zip(all_predictions, all_targets):
-        pred_boxes = preds['boxes']
-        pred_kps = preds['keypoints']
-        pred_scores = preds['scores']
-
-        gt_boxes = targets['boxes']
-        gt_kps = targets['keypoints']
-        gt_areas = targets['areas']
-
-        num_gt = len(gt_boxes)
-        total_gt += num_gt
-
-        if num_gt == 0:
-            # All predictions are false positives
-            for score in pred_scores:
-                all_detections.append((score, False, 0.0))
-            continue
-
-        if len(pred_boxes) == 0:
-            continue
-
-        # Track which GT have been matched
-        gt_matched = [False] * num_gt
-
-        # Sort predictions by score (descending)
-        sorted_indices = np.argsort(-pred_scores)
-
-        for pred_idx in sorted_indices:
-            pred_box = pred_boxes[pred_idx]
-            pred_kp = pred_kps[pred_idx]
-            pred_score = pred_scores[pred_idx]
-
-            best_oks = 0.0
-            best_gt_idx = -1
-
-            # Find best matching GT (by IoU first, then compute OKS)
-            for gt_idx in range(num_gt):
-                if gt_matched[gt_idx]:
-                    continue
-
-                iou = compute_iou(pred_box, gt_boxes[gt_idx])
-                if iou < iou_threshold:
-                    continue
-
-                # Compute OKS
-                oks = compute_oks(pred_kp, gt_kps[gt_idx], gt_areas[gt_idx])
-
-                if oks > best_oks:
-                    best_oks = oks
-                    best_gt_idx = gt_idx
-
-            # Check if it's a true positive
-            is_tp = best_oks >= oks_threshold and best_gt_idx >= 0
-            if is_tp:
-                gt_matched[best_gt_idx] = True
-
-            all_detections.append((pred_score, is_tp, best_oks))
-
-    if total_gt == 0 or len(all_detections) == 0:
-        return 0.0
-
-    # Sort by score descending
-    all_detections.sort(key=lambda x: -x[0])
-
-    # Compute precision-recall curve
-    tp_cumsum = 0
-    fp_cumsum = 0
-    precisions = []
-    recalls = []
-
-    for score, is_tp, oks in all_detections:
-        if is_tp:
-            tp_cumsum += 1
-        else:
-            fp_cumsum += 1
-
-        precision = tp_cumsum / (tp_cumsum + fp_cumsum)
-        recall = tp_cumsum / total_gt
-
-        precisions.append(precision)
-        recalls.append(recall)
-
-    # Compute AP using 101-point interpolation (COCO style)
-    ap = 0.0
-    for t in np.linspace(0, 1, 101):
-        # Find precision at recall >= t
-        p = 0.0
-        for prec, rec in zip(precisions, recalls):
-            if rec >= t:
-                p = max(p, prec)
-        ap += p / 101
-
-    return ap
+    names = ['AP', 'AP50', 'AP75', 'AP_M', 'AP_L', 'AR', 'AR50', 'AR75',
+             'AR_M', 'AR_L']
+    stats = {n: float(v) for n, v in zip(names, coco_eval.stats)}
+    return stats
 
 
 def parse_args():
@@ -215,7 +86,7 @@ def parse_args():
                         help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_decoder_led' (DETR-style LED)")
     parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14'],
                         help="Model size: b16 (ViT-B/16) or l14 (ViT-L/14)")
-    parser.add_argument("-FRAMES", type=int, default=9,
+    parser.add_argument("-FRAMES", type=int, default=1,
                         help="Number of input frames (image duplicated)")
     parser.add_argument("-DET", type=int, default=20,
                         help="Number of detection tokens")
@@ -281,6 +152,8 @@ def parse_args():
     # Validation
     parser.add_argument("-VAL_FREQ", type=int, default=1,
                         help="Validate every N epochs")
+    parser.add_argument("-VAL_BATCH_FREQ", type=int, default=0,
+                        help="Validate every N batches within an epoch (0 = disabled)")
     parser.add_argument("--NO_VAL", action='store_true',
                         help="Skip validation")
     parser.add_argument("--NO_TQDM", action='store_true',
@@ -607,7 +480,7 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                 pass
 
         # Validate every N batches
-        if val_loader is not None and (batch_idx + 1) % val_freq_batches == 0:
+        if val_loader is not None and val_freq_batches > 0 and (batch_idx + 1) % val_freq_batches == 0:
             if rank == 0:
                 print(f"\n  Validating at batch {batch_idx + 1}...", flush=True)
             val_stats = validate(model, val_loader, postprocess, rank, args, criterion, weight_dict)
@@ -619,12 +492,15 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
             # Log validation metrics to wandb
             if use_wandb:
                 global_step = epoch * num_total_batches + batch_idx
-                wandb.log({
+                wandb_val = {
                     'val/loss': val_stats['val_loss'],
-                    'val/ap_oks_50': val_stats['ap_oks_50'],
                     'val/total_detections': val_stats['total_det'],
                     'val/total_gt': val_stats['total_gt'],
-                }, step=global_step)
+                }
+                for k in ['AP', 'AP50', 'AP75', 'AR']:
+                    if k in val_stats:
+                        wandb_val[f'val/{k}'] = val_stats[k]
+                wandb.log(wandb_val, step=global_step)
             model.train()  # Switch back to train mode
 
     avg_loss = total_loss / max(num_batches, 1)
@@ -633,15 +509,17 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
 @torch.no_grad()
 def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_dict=None):
-    """Validate the model with AP@OKS=0.5 metric."""
+    """Validate the model using official COCO evaluation (pycocotools)."""
     model.eval()
 
-    all_results = []
-    all_predictions = []
-    all_targets = []
     imgsize = (args.HEIGHT, args.WIDTH)
+    num_keypoints = 17
+    coco_results = []
+    total_gt = 0
+    total_det = 0
     total_val_loss = 0
     num_val_batches = 0
+    num_images = 0
 
     # Use tqdm or simple iteration based on args
     if args.NO_TQDM:
@@ -657,55 +535,41 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
         outputs = model(samples)
         results = postprocess(outputs, imgsize, human_conf=0.5, keypoint_conf=0.3)
 
-        for i, (result, target) in enumerate(zip(results, targets)):
-            all_results.append({
-                'image_id': target['image_id'],
-                'num_detections': len(result['boxes']),
-                'num_gt': len(target['boxes']),
-            })
+        for result, target in zip(results, targets):
+            image_id = int(target['image_id'])
+            num_images += 1
+            total_gt += len(target['boxes'])
 
-            # Collect predictions for AP computation (pixel coordinates)
-            pred_boxes = result['boxes'].cpu().numpy()  # [N, 4] xyxy
-            pred_kps = result['keypoints'].cpu().numpy()  # [N, 17, 3]
-            pred_scores = result['scores'].cpu().numpy()  # [N]
+            pred_boxes = result['boxes'].cpu().numpy().astype(float)
+            pred_kps = result['keypoints'].cpu().numpy().astype(float)
+            pred_scores = result['scores'].cpu().numpy().astype(float)
+            total_det += len(pred_boxes)
 
-            all_predictions.append({
-                'boxes': pred_boxes,
-                'keypoints': pred_kps,
-                'scores': pred_scores,
-            })
+            # Rescale from resized coords to original image coords
+            orig_h, orig_w = target['orig_size'].tolist()
+            scale_x = orig_w / imgsize[1]
+            scale_y = orig_h / imgsize[0]
 
-            # Convert GT to pixel coordinates (from normalized cxcywh)
-            gt_boxes_norm = target['boxes'].cpu().numpy()  # [M, 4] cxcywh normalized
-            gt_kps_norm = target['keypoints'].cpu().numpy()  # [M, 17, 3] normalized
-
-            # Convert GT boxes: cxcywh normalized -> xyxy pixel
-            gt_boxes_pixel = []
-            gt_areas = []
-            for box in gt_boxes_norm:
-                cx, cy, w, h = box
-                x1 = (cx - w / 2) * imgsize[1]
-                y1 = (cy - h / 2) * imgsize[0]
-                x2 = (cx + w / 2) * imgsize[1]
-                y2 = (cy + h / 2) * imgsize[0]
-                gt_boxes_pixel.append([x1, y1, x2, y2])
-                # Area in pixels for OKS
-                gt_areas.append(w * imgsize[1] * h * imgsize[0])
-
-            gt_boxes_pixel = np.array(gt_boxes_pixel) if gt_boxes_pixel else np.zeros((0, 4))
-            gt_areas = np.array(gt_areas) if gt_areas else np.zeros(0)
-
-            # Convert GT keypoints to pixel coordinates
-            gt_kps_pixel = gt_kps_norm.copy()
-            if len(gt_kps_pixel) > 0:
-                gt_kps_pixel[:, :, 0] *= imgsize[1]  # x * width
-                gt_kps_pixel[:, :, 1] *= imgsize[0]  # y * height
-
-            all_targets.append({
-                'boxes': gt_boxes_pixel,
-                'keypoints': gt_kps_pixel,
-                'areas': gt_areas,
-            })
+            for pi in range(len(pred_boxes)):
+                box = pred_boxes[pi]
+                kps = pred_kps[pi]
+                kps_flat = []
+                for ki in range(num_keypoints):
+                    kps_flat.extend([
+                        float(kps[ki, 0]) * scale_x,
+                        float(kps[ki, 1]) * scale_y,
+                        2 if float(kps[ki, 2]) > 0.3 else 1,
+                    ])
+                coco_results.append({
+                    'image_id': image_id,
+                    'category_id': 1,
+                    'keypoints': kps_flat,
+                    'score': float(pred_scores[pi]),
+                    'bbox': [
+                        float(box[0]) * scale_x, float(box[1]) * scale_y,
+                        float(box[2] - box[0]) * scale_x, float(box[3] - box[1]) * scale_y,
+                    ],
+                })
 
         # Compute validation loss if criterion provided
         if criterion is not None and weight_dict is not None:
@@ -719,23 +583,20 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
             total_val_loss += losses.item()
             num_val_batches += 1
 
-    # Simple metrics: detection recall
-    total_gt = sum(r['num_gt'] for r in all_results)
-    total_det = sum(r['num_detections'] for r in all_results)
-
     val_loss = total_val_loss / max(num_val_batches, 1) if num_val_batches > 0 else 0.0
 
-    # Compute AP@OKS=0.5
-    ap_oks_50 = compute_ap_oks(all_predictions, all_targets, oks_threshold=0.5, iou_threshold=0.5)
-
+    # Run official COCO evaluation (only on rank 0 to avoid duplicate output)
+    coco_stats = {}
     if rank == 0:
-        loss_str = f"Validation: {len(all_results)} images, {total_gt} GT persons, {total_det} detections"
-        if num_val_batches > 0:
-            loss_str += f", AP@OKS=0.5: {ap_oks_50:.4f}"
-            loss_str += f", val_loss: {val_loss:.4f}"
-        print(loss_str, flush=True)
+        print(f"Validation: {num_images} images, {total_gt} GT persons, {total_det} detections, val_loss: {val_loss:.4f}", flush=True)
+        coco_stats = run_coco_eval(args.VAL_ANN, coco_results, sigmas=COCO_SIGMAS)
 
-    return {'total_gt': total_gt, 'total_det': total_det, 'val_loss': val_loss, 'ap_oks_50': ap_oks_50}
+    return {
+        'total_gt': total_gt,
+        'total_det': total_det,
+        'val_loss': val_loss,
+        **coco_stats,
+    }
 
 
 def main(args):
@@ -786,6 +647,19 @@ def main(args):
         if is_main_process():
             print(f"Resuming from {args.RESUME}", flush=True)
         state_dict = torch.load(args.RESUME, map_location='cpu', weights_only=True)
+
+        # Handle temporal positional embedding mismatch (e.g. checkpoint=9 frames, model=1 frame)
+        key = "vision_encoder.temporal_positional_embedding"
+        if key in state_dict:
+            old_shape = state_dict[key].shape  # [1, T_old, C]
+            new_shape = model.state_dict()[key].shape  # [1, T_new, C]
+            if old_shape[1] != new_shape[1]:
+                if is_main_process():
+                    print(f"  Interpolating temporal embed: {old_shape[1]} -> {new_shape[1]} frames", flush=True)
+                old_embed = state_dict[key].unsqueeze(2).permute(0, 3, 1, 2).float()  # [1, C, T_old, 1]
+                new_embed = F.interpolate(old_embed, size=(new_shape[1], 1), mode='bilinear', align_corners=False)
+                state_dict[key] = new_embed.permute(0, 2, 3, 1).squeeze(2)  # [1, T_new, C]
+
         model.load_state_dict(state_dict, strict=False)
 
     # Freeze encoder parameters if requested
@@ -912,7 +786,7 @@ def main(args):
             model, criterion, weight_dict, train_loader, optimizer, epoch, rank, args,
             val_loader=val_loader if not args.NO_VAL else None,
             postprocess=postprocess if not args.NO_VAL else None,
-            val_freq_batches=100,
+            val_freq_batches=args.VAL_BATCH_FREQ,
             use_wandb=use_wandb
         )
 
@@ -943,10 +817,10 @@ def main(args):
                 'epoch': epoch,
             }
             if val_stats is not None:
-                epoch_metrics.update({
-                    'epoch/val_loss': val_stats['val_loss'],
-                    'epoch/ap_oks_50': val_stats['ap_oks_50'],
-                })
+                epoch_metrics['epoch/val_loss'] = val_stats['val_loss']
+                for k in ['AP', 'AP50', 'AP75', 'AR']:
+                    if k in val_stats:
+                        epoch_metrics[f'epoch/{k}'] = val_stats[k]
             wandb.log(epoch_metrics)
 
         # Save checkpoint

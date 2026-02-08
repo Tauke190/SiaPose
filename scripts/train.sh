@@ -11,7 +11,7 @@ CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 train_pose.py \
        -COCO_ROOT /mnt/SSD2/coco2017/images \
        -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
        -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
-       -BS 32 -EPOCH 50 -LR 1e-4 --SAVE \
+       -BS 32 -EPOCH 50 -LR 1e-4 --SAVE -FRAMES 1 \
        --RESUME weights/avak_b16_11.pt \
        -WORKERS 8  
        # --NO_TQDM 
