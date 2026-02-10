@@ -45,6 +45,48 @@ COCO_SIGMAS = np.array([
 ])
 
 
+def compute_oks(pred_xy, gt_kps, gt_area, sigmas):
+    """Compute OKS between one predicted and one GT person instance.
+
+    Args:
+        pred_xy: np.array [K, 2] predicted (x, y) in original image coords
+        gt_kps:  np.array [K, 3] ground truth (x, y, v) in original image coords
+        gt_area: float, area of GT bounding box in pixels
+        sigmas:  np.array [K], per-keypoint sigma
+    Returns:
+        float OKS score in [0, 1]
+    """
+    xg, yg, vg = gt_kps[:, 0], gt_kps[:, 1], gt_kps[:, 2]
+    xd, yd = pred_xy[:, 0], pred_xy[:, 1]
+    visible = vg > 0
+    if visible.sum() == 0:
+        return 0.0
+    dx = xd - xg
+    dy = yd - yg
+    vars = (sigmas * 2) ** 2
+    e = (dx**2 + dy**2) / (2 * gt_area * vars + np.spacing(1))
+    return float(np.sum(np.exp(-e[visible])) / visible.sum())
+
+
+def box_iou_np(box_a, boxes_b):
+    """Compute IoU between one box and an array of boxes (xyxy format).
+
+    Args:
+        box_a:  np.array [4] (x1, y1, x2, y2)
+        boxes_b: np.array [M, 4]
+    Returns:
+        np.array [M] of IoU values
+    """
+    xa1 = np.maximum(box_a[0], boxes_b[:, 0])
+    ya1 = np.maximum(box_a[1], boxes_b[:, 1])
+    xa2 = np.minimum(box_a[2], boxes_b[:, 2])
+    ya2 = np.minimum(box_a[3], boxes_b[:, 3])
+    inter = np.maximum(xa2 - xa1, 0) * np.maximum(ya2 - ya1, 0)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (boxes_b[:, 2] - boxes_b[:, 0]) * (boxes_b[:, 3] - boxes_b[:, 1])
+    return inter / (area_a + area_b - inter + np.spacing(1))
+
+
 def run_coco_eval(ann_file, coco_results, sigmas=None):
     """Run the official COCO keypoint evaluation via pycocotools.
 
@@ -295,7 +337,7 @@ def build_criterion(args, rank):
     criterion = SetCriterion(
         matcher=matcher,
         weight_dict=weight_dict,
-        eos_coef=0.1,
+        eos_coef=0.3,
         losses=['keypoints', 'boxes', 'human'],  # All losses for DDP compatibility
         num_keypoints=17  # COCO has 17 keypoints, needed for RLE loss sigma
     )
@@ -406,6 +448,7 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
     total_loss = 0
     num_batches = 0
+    total_train_det = 0
     batch_stats = []
     num_total_batches = len(dataloader)
     log_freq = max(1, num_total_batches // 10)  # Log ~10 times per epoch when no tqdm
@@ -445,6 +488,14 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
         total_loss += loss_value
         num_batches += 1
 
+        # Count detections
+        if postprocess is not None:
+            with torch.no_grad():
+                imgsize = (args.HEIGHT, args.WIDTH)
+                batch_results = postprocess(outputs, imgsize, human_conf=0.5, keypoint_conf=0.3)
+                batch_det = sum(len(r['boxes']) for r in batch_results)
+                total_train_det += batch_det
+
         # Log progress
         if rank == 0:
             loss_str = f"loss: {loss_value:.3f}"
@@ -466,6 +517,7 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                 wandb_metrics = {
                     'train/loss': loss_value,
                     'train/epoch': epoch + (batch_idx + 1) / num_total_batches,
+                    'train/total_detections': total_train_det,
                 }
                 for k, v in loss_dict.items():
                     if k in weight_dict:
@@ -497,14 +549,14 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                     'val/total_detections': val_stats['total_det'],
                     'val/total_gt': val_stats['total_gt'],
                 }
-                for k in ['AP', 'AP50', 'AP75', 'AR']:
+                for k in ['AP', 'AP50', 'AP75', 'AR', 'mean_oks']:
                     if k in val_stats:
                         wandb_val[f'val/{k}'] = val_stats[k]
                 wandb.log(wandb_val, step=global_step)
             model.train()  # Switch back to train mode
 
     avg_loss = total_loss / max(num_batches, 1)
-    return avg_loss, batch_stats
+    return avg_loss, batch_stats, total_train_det
 
 
 @torch.no_grad()
@@ -520,6 +572,8 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
     total_val_loss = 0
     num_val_batches = 0
     num_images = 0
+    total_oks = 0.0
+    num_oks_matched = 0
 
     # Use tqdm or simple iteration based on args
     if args.NO_TQDM:
@@ -571,6 +625,52 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
                     ],
                 })
 
+            # Compute per-instance OKS with greedy IoU matching
+            gt_boxes_norm = target['boxes'].cpu().numpy().astype(float)  # [M, 4] cxcywh normalized
+            gt_kps_norm = target['keypoints'].cpu().numpy().astype(float)  # [M, 17, 3] normalized
+
+            if len(pred_boxes) > 0 and len(gt_boxes_norm) > 0:
+                # Convert GT boxes: normalized cxcywh -> pixel xyxy
+                gt_boxes_pixel = np.zeros_like(gt_boxes_norm)
+                gt_boxes_pixel[:, 0] = (gt_boxes_norm[:, 0] - gt_boxes_norm[:, 2] / 2) * orig_w
+                gt_boxes_pixel[:, 1] = (gt_boxes_norm[:, 1] - gt_boxes_norm[:, 3] / 2) * orig_h
+                gt_boxes_pixel[:, 2] = (gt_boxes_norm[:, 0] + gt_boxes_norm[:, 2] / 2) * orig_w
+                gt_boxes_pixel[:, 3] = (gt_boxes_norm[:, 1] + gt_boxes_norm[:, 3] / 2) * orig_h
+
+                # Convert GT keypoints to pixel coords
+                gt_kps_pixel = gt_kps_norm.copy()
+                gt_kps_pixel[:, :, 0] *= orig_w
+                gt_kps_pixel[:, :, 1] *= orig_h
+
+                # GT bbox areas (w * h in pixels)
+                gt_areas = (gt_boxes_pixel[:, 2] - gt_boxes_pixel[:, 0]) * \
+                           (gt_boxes_pixel[:, 3] - gt_boxes_pixel[:, 1])
+
+                # Pred boxes in pixel xyxy
+                pred_boxes_pixel = np.zeros((len(pred_boxes), 4))
+                pred_boxes_pixel[:, 0] = pred_boxes[:, 0] * scale_x
+                pred_boxes_pixel[:, 1] = pred_boxes[:, 1] * scale_y
+                pred_boxes_pixel[:, 2] = pred_boxes[:, 2] * scale_x
+                pred_boxes_pixel[:, 3] = pred_boxes[:, 3] * scale_y
+
+                # Greedy matching: preds sorted by score (already sorted from postprocess)
+                matched_gt = set()
+                for pi in range(len(pred_boxes_pixel)):
+                    ious = box_iou_np(pred_boxes_pixel[pi], gt_boxes_pixel)
+                    order = np.argsort(-ious)
+                    for gi in order:
+                        if gi not in matched_gt and ious[gi] > 0.0:
+                            # Compute OKS for this (pred, gt) pair
+                            pred_xy = np.stack([
+                                pred_kps[pi, :, 0] * scale_x,
+                                pred_kps[pi, :, 1] * scale_y,
+                            ], axis=1)
+                            oks = compute_oks(pred_xy, gt_kps_pixel[gi], gt_areas[gi], COCO_SIGMAS)
+                            total_oks += oks
+                            num_oks_matched += 1
+                            matched_gt.add(gi)
+                            break
+
         # Compute validation loss if criterion provided
         if criterion is not None and weight_dict is not None:
             for t in targets:
@@ -584,17 +684,20 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
             num_val_batches += 1
 
     val_loss = total_val_loss / max(num_val_batches, 1) if num_val_batches > 0 else 0.0
+    mean_oks = total_oks / max(num_oks_matched, 1)
 
     # Run official COCO evaluation (only on rank 0 to avoid duplicate output)
     coco_stats = {}
     if rank == 0:
-        print(f"Validation: {num_images} images, {total_gt} GT persons, {total_det} detections, val_loss: {val_loss:.4f}", flush=True)
+        print(f"Validation: {num_images} images, {total_gt} GT persons, {total_det} detections, "
+              f"val_loss: {val_loss:.4f}, mean_oks: {mean_oks:.4f} ({num_oks_matched} matched)", flush=True)
         coco_stats = run_coco_eval(args.VAL_ANN, coco_results, sigmas=COCO_SIGMAS)
 
     return {
         'total_gt': total_gt,
         'total_det': total_det,
         'val_loss': val_loss,
+        'mean_oks': mean_oks,
         **coco_stats,
     }
 
@@ -704,7 +807,8 @@ def main(args):
         annFile=args.TRAIN_ANN,
         transforms=transforms,
         frames=args.FRAMES,
-        min_keypoints=args.MIN_KP
+        min_keypoints=args.MIN_KP,
+        augment=True,
     )
 
     # Use DistributedSampler only for multi-GPU
@@ -762,6 +866,7 @@ def main(args):
                 pin_memory=True
             )
         postprocess = PostProcessPose()
+        
 
     # Create experiment directory
     exp_dir = os.path.join('output', args.EXP)
@@ -782,10 +887,10 @@ def main(args):
             train_sampler.set_epoch(epoch)
 
         # Train
-        avg_loss, batch_stats = train_one_epoch(
+        avg_loss, batch_stats, total_train_det = train_one_epoch(
             model, criterion, weight_dict, train_loader, optimizer, epoch, rank, args,
             val_loader=val_loader if not args.NO_VAL else None,
-            postprocess=postprocess if not args.NO_VAL else None,
+            postprocess=postprocess,
             val_freq_batches=args.VAL_BATCH_FREQ,
             use_wandb=use_wandb
         )
@@ -793,7 +898,7 @@ def main(args):
         scheduler.step()
 
         if is_main_process():
-            print(f"Epoch {epoch}: avg_loss = {avg_loss:.4f}, lr = {scheduler.get_last_lr()[0]:.2e}", flush=True)
+            print(f"Epoch {epoch}: avg_loss = {avg_loss:.4f}, lr = {scheduler.get_last_lr()[0]:.2e}, train_det: {total_train_det}", flush=True)
             if batch_stats:
                 print(f"  Batch validations: {len(batch_stats)} checkpoints", flush=True)
 
@@ -814,11 +919,12 @@ def main(args):
             epoch_metrics = {
                 'epoch/train_loss': avg_loss,
                 'epoch/lr': scheduler.get_last_lr()[0],
+                'epoch/train_detections': total_train_det,
                 'epoch': epoch,
             }
             if val_stats is not None:
                 epoch_metrics['epoch/val_loss'] = val_stats['val_loss']
-                for k in ['AP', 'AP50', 'AP75', 'AR']:
+                for k in ['AP', 'AP50', 'AP75', 'AR', 'mean_oks']:
                     if k in val_stats:
                         epoch_metrics[f'epoch/{k}'] = val_stats[k]
             wandb.log(epoch_metrics)

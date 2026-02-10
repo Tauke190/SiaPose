@@ -85,6 +85,48 @@ def compute_iou(box1, box2):
     return inter / (area1 + area2 - inter + 1e-8)
 
 
+def compute_oks(pred_xy, gt_kps, gt_area, sigmas):
+    """Compute OKS between one predicted and one GT person instance.
+
+    Args:
+        pred_xy: np.array [K, 2] predicted (x, y) in original image coords
+        gt_kps:  np.array [K, 3] ground truth (x, y, v) in original image coords
+        gt_area: float, area of GT bounding box in pixels
+        sigmas:  np.array [K], per-keypoint sigma
+    Returns:
+        float OKS score in [0, 1]
+    """
+    xg, yg, vg = gt_kps[:, 0], gt_kps[:, 1], gt_kps[:, 2]
+    xd, yd = pred_xy[:, 0], pred_xy[:, 1]
+    visible = vg > 0
+    if visible.sum() == 0:
+        return 0.0
+    dx = xd - xg
+    dy = yd - yg
+    vars = (sigmas * 2) ** 2
+    e = (dx**2 + dy**2) / (2 * gt_area * vars + np.spacing(1))
+    return float(np.sum(np.exp(-e[visible])) / visible.sum())
+
+
+def box_iou_np(box_a, boxes_b):
+    """Compute IoU between one box and an array of boxes (xyxy format).
+
+    Args:
+        box_a:  np.array [4] (x1, y1, x2, y2)
+        boxes_b: np.array [M, 4]
+    Returns:
+        np.array [M] of IoU values
+    """
+    xa1 = np.maximum(box_a[0], boxes_b[:, 0])
+    ya1 = np.maximum(box_a[1], boxes_b[:, 1])
+    xa2 = np.minimum(box_a[2], boxes_b[:, 2])
+    ya2 = np.minimum(box_a[3], boxes_b[:, 3])
+    inter = np.maximum(xa2 - xa1, 0) * np.maximum(ya2 - ya1, 0)
+    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
+    area_b = (boxes_b[:, 2] - boxes_b[:, 0]) * (boxes_b[:, 3] - boxes_b[:, 1])
+    return inter / (area_a + area_b - inter + np.spacing(1))
+
+
 def map_coco17_to_posetrack15(pred_kps_17):
     """Map model's 17 COCO keypoints to PoseTrack's 15 keypoints.
 
@@ -307,10 +349,11 @@ def collate_fn(batch):
 
 @torch.no_grad()
 def evaluate(model, dataloader, postprocess, args, num_keypoints,
-             kp_map_fn=None):
+             sigmas, kp_map_fn=None):
     """Run inference and collect predictions in COCO result format.
 
     Args:
+        sigmas: np.array of per-keypoint OKS sigmas
         kp_map_fn: optional callable that maps model's 17 COCO keypoint
                    predictions [N,17,3] to the dataset's keypoint format
                    [N,K,3] (e.g. PoseTrack 15 keypoints).
@@ -319,6 +362,7 @@ def evaluate(model, dataloader, postprocess, args, num_keypoints,
         coco_results: list of COCO-format result dicts
         num_images: number of images evaluated
         total_inference_time: total model forward-pass time in seconds
+        mean_oks: mean OKS over all matched pred-GT pairs
     """
     model.eval()
     device = next(model.parameters()).device
@@ -327,6 +371,8 @@ def evaluate(model, dataloader, postprocess, args, num_keypoints,
     coco_results = []
     total_inference_time = 0.0
     num_images = 0
+    total_oks = 0.0
+    num_oks_matched = 0
 
     for samples, targets in tqdm(dataloader, desc="Evaluating", file=sys.stderr):
         samples = samples.to(device)
@@ -379,7 +425,53 @@ def evaluate(model, dataloader, postprocess, args, num_keypoints,
                     ],
                 })
 
-    return coco_results, num_images, total_inference_time
+            # Compute per-instance OKS with greedy IoU matching
+            gt_boxes_norm = target['boxes'].cpu().numpy().astype(float)
+            gt_kps_norm = target['keypoints'].cpu().numpy().astype(float)
+
+            if len(pred_boxes) > 0 and len(gt_boxes_norm) > 0:
+                # Convert GT boxes: normalized cxcywh -> pixel xyxy
+                gt_boxes_pixel = np.zeros_like(gt_boxes_norm)
+                gt_boxes_pixel[:, 0] = (gt_boxes_norm[:, 0] - gt_boxes_norm[:, 2] / 2) * orig_w
+                gt_boxes_pixel[:, 1] = (gt_boxes_norm[:, 1] - gt_boxes_norm[:, 3] / 2) * orig_h
+                gt_boxes_pixel[:, 2] = (gt_boxes_norm[:, 0] + gt_boxes_norm[:, 2] / 2) * orig_w
+                gt_boxes_pixel[:, 3] = (gt_boxes_norm[:, 1] + gt_boxes_norm[:, 3] / 2) * orig_h
+
+                # Convert GT keypoints to pixel coords
+                gt_kps_pixel = gt_kps_norm.copy()
+                gt_kps_pixel[:, :, 0] *= orig_w
+                gt_kps_pixel[:, :, 1] *= orig_h
+
+                # GT bbox areas (w * h in pixels)
+                gt_areas = (gt_boxes_pixel[:, 2] - gt_boxes_pixel[:, 0]) * \
+                           (gt_boxes_pixel[:, 3] - gt_boxes_pixel[:, 1])
+
+                # Pred boxes in pixel xyxy
+                pred_boxes_pixel = np.zeros((len(pred_boxes), 4))
+                pred_boxes_pixel[:, 0] = pred_boxes[:, 0] * scale_x
+                pred_boxes_pixel[:, 1] = pred_boxes[:, 1] * scale_y
+                pred_boxes_pixel[:, 2] = pred_boxes[:, 2] * scale_x
+                pred_boxes_pixel[:, 3] = pred_boxes[:, 3] * scale_y
+
+                # Greedy matching: preds sorted by score (already sorted from postprocess)
+                matched_gt = set()
+                for pi in range(len(pred_boxes_pixel)):
+                    ious = box_iou_np(pred_boxes_pixel[pi], gt_boxes_pixel)
+                    order = np.argsort(-ious)
+                    for gi in order:
+                        if gi not in matched_gt and ious[gi] > 0.0:
+                            pred_xy = np.stack([
+                                pred_kps[pi, :, 0] * scale_x,
+                                pred_kps[pi, :, 1] * scale_y,
+                            ], axis=1)
+                            oks = compute_oks(pred_xy, gt_kps_pixel[gi], gt_areas[gi], sigmas)
+                            total_oks += oks
+                            num_oks_matched += 1
+                            matched_gt.add(gi)
+                            break
+
+    mean_oks = total_oks / max(num_oks_matched, 1)
+    return coco_results, num_images, total_inference_time, mean_oks
 
 
 # ---------------------------------------------------------------------------
@@ -497,13 +589,13 @@ def main():
     # Run inference
     print("\n[3/4] Running inference...")
     postprocess = PostProcessPose()
-    coco_results, num_images, inference_time = evaluate(
+    coco_results, num_images, inference_time, mean_oks = evaluate(
         model, dataloader, postprocess, args, num_kp,
-        kp_map_fn=kp_map_fn,
+        sigmas=sigmas, kp_map_fn=kp_map_fn,
     )
 
     fps = num_images / inference_time if inference_time > 0 else 0
-    print(f"      {num_images} images, {len(coco_results)} detections, {fps:.1f} img/s")
+    print(f"      {num_images} images, {len(coco_results)} detections, {fps:.1f} img/s, mean_oks: {mean_oks:.4f}")
 
     # Official COCO evaluation
     print(f"\n{'='*60}")
@@ -516,6 +608,7 @@ def main():
         'num_images': num_images,
         'total_detections': len(coco_results),
         'fps': round(fps, 1),
+        'mean_oks': round(mean_oks, 4),
         **coco_stats,
     }
 

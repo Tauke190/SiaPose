@@ -44,7 +44,7 @@ torchrun --nproc_per_node=2 train_pose.py \
        -COCO_ROOT /home/c3-0/datasets/coco \
        -TRAIN_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_train2017.json \
        -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
-       -BS 32 -EPOCH 50 -LR 1e-4 --SAVE -FRAMES 1 \
+       -BS 128 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 \
         --RESUME weights/avak_b16_11.pt \
        -WORKERS 12 -EXP sia_pose_simple \
        --NO_TQDM --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN pose_rle_experiment

@@ -5,13 +5,18 @@ Loads COCO person keypoint annotations and creates video-like clips
 by duplicating the image for temporal consistency with the SIA model.
 """
 import os
+import random
 import torch
 from torch.utils.data import Dataset
 import numpy as np
 from PIL import Image
 from pycocotools.coco import COCO
+from torchvision.transforms import ColorJitter
 
 from util.box_ops import box_xyxy_to_cxcywh
+
+# Left/right keypoint pairs for horizontal flip (COCO 17-keypoint format)
+COCO_FLIP_PAIRS = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)]
 
 
 class COCOPose(Dataset):
@@ -34,12 +39,15 @@ class COCOPose(Dataset):
         frames=9,
         min_keypoints=5,
         min_area=32 * 32,
+        augment=False,
     ):
         self.root = root
         self.transforms = transforms
         self.frames = frames
         self.min_keypoints = min_keypoints
         self.min_area = min_area
+        self.augment = augment
+        self.color_jitter = ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1) if augment else None
 
         # Load COCO annotations
         self.coco = COCO(annFile)
@@ -76,16 +84,6 @@ class COCOPose(Dataset):
         img = Image.open(img_path).convert('RGB')
         img_w, img_h = img.size
 
-        # Convert to tensor and normalize to [0, 1]
-        img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
-
-        # Apply transforms (resize, normalize)
-        if self.transforms is not None:
-            img_tensor = self.transforms(img_tensor)
-
-        # Create video clip by duplicating frame
-        clip = img_tensor.unsqueeze(0).repeat(self.frames, 1, 1, 1)  # [T, C, H, W]
-
         # Get annotations
         ann_ids = self.coco.getAnnIds(imgIds=img_id, catIds=self.cat_ids, iscrowd=False)
         anns = self.coco.loadAnns(ann_ids)
@@ -97,37 +95,66 @@ class COCOPose(Dataset):
             and ann.get('area', 0) >= self.min_area
         ]
 
-        # Extract boxes and keypoints
+        # Extract boxes and keypoints in pixel coordinates
+        boxes_pixel = []  # list of [x1, y1, x2, y2] in pixels
+        kps_pixel = []    # list of [17, 3] arrays in pixels
+
+        for ann in valid_anns:
+            x, y, w, h = ann['bbox']
+            boxes_pixel.append([x, y, x + w, y + h])
+
+            kp = np.array(ann['keypoints']).reshape(-1, 3).astype(np.float32)
+            kps_pixel.append(kp)
+
+        # --- Augmentations (training only) ---
+        if self.augment:
+            # Random horizontal flip (p=0.5)
+            if random.random() < 0.5:
+                img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                for i in range(len(boxes_pixel)):
+                    x1, y1, x2, y2 = boxes_pixel[i]
+                    boxes_pixel[i] = [img_w - x2, y1, img_w - x1, y2]
+
+                for kp in kps_pixel:
+                    # Flip x-coordinates for labeled keypoints
+                    labeled = kp[:, 2] > 0
+                    kp[labeled, 0] = img_w - kp[labeled, 0]
+                    # Swap left/right keypoint pairs
+                    for l, r in COCO_FLIP_PAIRS:
+                        kp[l], kp[r] = kp[r].copy(), kp[l].copy()
+
+            # Color jitter
+            img = self.color_jitter(img)
+
+        # Convert to tensor and normalize to [0, 1]
+        img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
+
+        # Apply transforms (resize, normalize)
+        if self.transforms is not None:
+            img_tensor = self.transforms(img_tensor)
+
+        # Create video clip by duplicating frame
+        clip = img_tensor.unsqueeze(0).repeat(self.frames, 1, 1, 1)  # [T, C, H, W]
+
+        # Normalize coordinates to [0, 1] and build target
         boxes = []
         keypoints = []
 
-        for ann in valid_anns:
-            # Bounding box: [x, y, w, h] -> normalize to [0, 1]
-            x, y, w, h = ann['bbox']
-            # Convert to [x1, y1, x2, y2] normalized
-            x1 = x / img_w
-            y1 = y / img_h
-            x2 = (x + w) / img_w
-            y2 = (y + h) / img_h
+        for i in range(len(boxes_pixel)):
+            x1, y1, x2, y2 = boxes_pixel[i]
+            # Normalize to [0, 1]
+            x1 = max(0, min(1, x1 / img_w))
+            y1 = max(0, min(1, y1 / img_h))
+            x2 = max(0, min(1, x2 / img_w))
+            y2 = max(0, min(1, y2 / img_h))
 
-            # Clamp to [0, 1]
-            x1 = max(0, min(1, x1))
-            y1 = max(0, min(1, y1))
-            x2 = max(0, min(1, x2))
-            y2 = max(0, min(1, y2))
-
-            # Convert to cxcywh format
             box = torch.tensor([x1, y1, x2, y2])
             box = box_xyxy_to_cxcywh(box)
             boxes.append(box)
 
-            # Keypoints: [x1, y1, v1, x2, y2, v2, ...] -> [17, 3]
-            kp = np.array(ann['keypoints']).reshape(-1, 3).astype(np.float32)
-            # Normalize x, y to [0, 1]
-            kp[:, 0] = kp[:, 0] / img_w  # x
-            kp[:, 1] = kp[:, 1] / img_h  # y
-            # visibility: 0=not labeled, 1=labeled but occluded, 2=labeled and visible
-            # Keep as is for loss computation
+            kp = kps_pixel[i].copy()
+            kp[:, 0] = kp[:, 0] / img_w
+            kp[:, 1] = kp[:, 1] / img_h
             keypoints.append(torch.from_numpy(kp))
 
         # Stack tensors
