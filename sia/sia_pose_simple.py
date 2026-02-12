@@ -30,7 +30,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .sia_vision import (
+from .sia_vision_clip import (
     VisionTransformer, MLP, inflate_weight, load_state_dict,
     _MODELS
 )
@@ -211,7 +211,7 @@ def clip_joint_b16_simple(
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-B/16"
         logger.info('load pretrained weights')
-        state_dict = torch.load(_MODELS[model_name], map_location='cpu')
+        state_dict = torch.load(_MODELS[model_name], map_location='cpu', weights_only=False)
         load_state_dict(model, state_dict, input_resolution=input_resolution, patch_size=16, center=center)
     return model.eval()
 
@@ -233,7 +233,7 @@ def clip_joint_l14_simple(
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-L/14"
         logger.info('load pretrained weights')
-        state_dict = torch.load(_MODELS[model_name], map_location='cpu')
+        state_dict = torch.load(_MODELS[model_name], map_location='cpu', weights_only=False)
         load_state_dict(model, state_dict, input_resolution=input_resolution, patch_size=14, center=center)
     return model.eval()
 
@@ -291,7 +291,7 @@ class SIA_POSE_SIMPLE(nn.Module):
 
         if pretrain:
             logger.info(f"Load pretrained weights from {pretrain}")
-            state_dict = torch.load(pretrain, map_location='cpu')['model']
+            state_dict = torch.load(pretrain, map_location='cpu', weights_only=False)['model']
             state_dict = interpolate_pos_embed_vit(state_dict, self)
             self.load_state_dict(state_dict, strict=False)
 

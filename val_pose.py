@@ -29,7 +29,7 @@ from torchvision.transforms import v2
 from tqdm import tqdm
 
 from sia import (
-    get_sia_pose, get_sia_pose_simple, get_sia_pose_decoder_led,
+    get_sia_pose, get_sia_pose_simple,
     PostProcessPose, COCO_KEYPOINT_NAMES,
 )
 from datasets import COCOPoseVal, PoseTrackPoseVal

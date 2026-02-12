@@ -5,7 +5,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .sia_vision import clip_joint_l14, clip_joint_b16
+from .sia_vision_clip import clip_joint_l14, clip_joint_b16
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +60,7 @@ class SIA_POSE(nn.Module):
 
         if pretrain:
             logger.info(f"Load pretrained weights from {pretrain}")
-            state_dict = torch.load(pretrain, map_location='cpu')['model']
+            state_dict = torch.load(pretrain, map_location='cpu', weights_only=False)['model']
             state_dict = interpolate_pos_embed_vit(state_dict, self) # interpolate temporal embeddings
             self.load_state_dict(state_dict, strict=False)
 

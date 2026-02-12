@@ -1,7 +1,8 @@
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 from .sia_pose import SIA_POSE
 from .sia_pose_simple import SIA_POSE_SIMPLE
-from .sia_pose_decoder_led import SIA_POSE_DECODER_LED
+from .sia_pose_heatmap import SIA_POSE_HEATMAP
+from .sia_pose_dino_simple import SIA_POSE_DINO_SIMPLE
 from torch import nn
 import torch.nn.functional as F
 from torchvision.ops import batched_nms, sigmoid_focal_loss
@@ -61,30 +62,79 @@ def get_sia_pose_simple(size='l',
     return m
 
 
-def get_sia_pose_decoder_led(size='l',
-                             pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
-                             det_token_num=100,
-                             num_frames=9,
-                             num_keypoints=17,
-                             decoder_layers=3):
+def get_sia_pose_heatmap(size='l',
+                          pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
+                          det_token_num=100,
+                          num_frames=9,
+                          num_keypoints=17):
     """
-    Get SIA pose model with Late Encoder-Decoder (LED) architecture.
+    Get SIA pose model with ViTPose-style heatmap decoder.
 
     Architecture:
-    - The encoder processes ONLY spatial tokens (no detection tokens)
-    - Detection/pose queries are introduced in a separate decoder module
-    - The decoder cross-attends to encoder spatial features (like DETR)
-
-    This follows DETR-style design where detection queries don't participate
-    in encoder self-attention, keeping encoder weights closer to pretrained CLIP.
+    - ViT Encoder with detection and pose tokens
+    - Classic deconv heatmap decoder on spatial features
+    - Global heatmap output: K = Conv1x1( Deconv( Deconv( Fout ) ) )
     """
-    sia_model = SIA_POSE_DECODER_LED(
+    sia_model = SIA_POSE_HEATMAP(
         size=size,
         pretrain=pretrain,
         det_token_num=det_token_num,
         num_frames=num_frames,
         num_keypoints=num_keypoints,
+    )
+    m = {'sia': sia_model}
+    return m
+
+
+def get_sia_pose_dino(size='b',
+                      det_token_num=100,
+                      num_frames=1,
+                      num_keypoints=17,
+                      decoder_layers=3):
+    """
+    Get SIA pose model with DINOv2 backbone + LED decoder.
+
+    DINOv2 weights are loaded automatically via torch.hub (no manual pretrain path needed).
+
+    Args:
+        size: 'b' for ViT-B/14 (768d) or 'l' for ViT-L/14 (1024d)
+        det_token_num: Number of detection queries
+        num_frames: Number of input frames
+        num_keypoints: Number of keypoints (17 for COCO)
+        decoder_layers: Number of LED decoder layers
+    """
+    sia_model = SIA_POSE_DINO(
+        size=size,
+        det_token_num=det_token_num,
+        num_frames=num_frames,
+        num_keypoints=num_keypoints,
         decoder_layers=decoder_layers,
+    )
+    m = {'sia': sia_model}
+    return m
+
+
+def get_sia_pose_dino_simple(size='b',
+                             det_token_num=100,
+                             num_frames=1,
+                             num_keypoints=17):
+    """
+    Get SIA pose model with DINOv2 backbone, encoder-only (no decoder).
+
+    Detection and pose tokens go through DINOv2's encoder alongside patch tokens.
+    Keypoints are predicted directly from pose tokens.
+
+    Args:
+        size: 'b' for ViT-B/14 (768d) or 'l' for ViT-L/14 (1024d)
+        det_token_num: Number of detection/pose queries
+        num_frames: Number of input frames
+        num_keypoints: Number of keypoints (17 for COCO)
+    """
+    sia_model = SIA_POSE_DINO_SIMPLE(
+        size=size,
+        det_token_num=det_token_num,
+        num_frames=num_frames,
+        num_keypoints=num_keypoints,
     )
     m = {'sia': sia_model}
     return m
@@ -376,6 +426,63 @@ class SetCriterion(nn.Module):
 
         return losses
 
+    def loss_keypoints_heatmap(self, outputs, targets, indices, num_boxes, num_classes):
+        """Compute the heatmap-based keypoint loss (ViTPose-style MSE).
+
+        Generates GT Gaussian heatmaps on-the-fly from normalized keypoint coordinates
+        and computes MSE against predicted heatmaps. All persons in the image contribute
+        to the same global heatmap channel (max-pooled).
+
+        outputs must contain:
+            'pred_heatmaps': [B, K, H_hm, W_hm] (softmax probability maps)
+        targets must contain:
+            'keypoints': list of [N_persons, K, 3] normalized (x, y, vis)
+        """
+        if 'pred_heatmaps' not in outputs:
+            return {}
+        if len(targets) == 0 or 'keypoints' not in targets[0]:
+            return {}
+
+        pred_heatmaps = outputs['pred_heatmaps']  # [B, K, H_hm, W_hm]
+        B, K, H_hm, W_hm = pred_heatmaps.shape
+        device = pred_heatmaps.device
+        sigma = 2.0  # Gaussian sigma in heatmap pixels
+
+        # Build GT heatmaps
+        gt_heatmaps = torch.zeros_like(pred_heatmaps)
+
+        # Coordinate grids in pixel space [H_hm, W_hm]
+        ys = torch.arange(H_hm, device=device).float()
+        xs = torch.arange(W_hm, device=device).float()
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # [H_hm, W_hm]
+
+        for b, t in enumerate(targets):
+            kps = t['keypoints']  # [N_persons, K, 3]
+            for k in range(K):
+                vis_mask = kps[:, k, 2] > 0  # [N_persons]
+                if not vis_mask.any():
+                    continue
+                # GT keypoint pixel coords in heatmap space
+                cx = kps[vis_mask, k, 0] * W_hm  # [N_vis]
+                cy = kps[vis_mask, k, 1] * H_hm   # [N_vis]
+                # Vectorized Gaussian: [N_vis, H_hm, W_hm]
+                gaussians = torch.exp(
+                    -((grid_x.unsqueeze(0) - cx.view(-1, 1, 1)) ** 2
+                      + (grid_y.unsqueeze(0) - cy.view(-1, 1, 1)) ** 2)
+                    / (2 * sigma ** 2)
+                )
+                # Max-pool over persons, clamp to [0, 1]
+                gt_heatmaps[b, k] = gaussians.max(dim=0).values.clamp(0, 1)
+
+        # Normalize GT heatmaps to sum to 1 (like softmax pred)
+        gt_sum = gt_heatmaps.view(B, K, -1).sum(dim=-1, keepdim=True).view(B, K, 1, 1)
+        gt_heatmaps = gt_heatmaps / (gt_sum + 1e-8)
+
+        # MSE loss
+        mse = F.mse_loss(pred_heatmaps, gt_heatmaps)
+
+        return {'loss_keypoints': mse}
+
     def loss_masks(self, outputs, targets, indices, num_boxes, num_classes): #quick fix for num_classes for loss_label
         """Compute the losses related to the masks: the focal loss and the dice loss.
            targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
@@ -425,6 +532,7 @@ class SetCriterion(nn.Module):
             'masks': self.loss_masks,
             'human': self.loss_human, #HUMAN
             'keypoints': self.loss_keypoints, #KEYPOINT
+            'keypoints_heatmap': self.loss_keypoints_heatmap, #HEATMAP
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         #return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
@@ -635,6 +743,7 @@ class PostProcessPose(nn.Module):
         out_human = outputs['human_logits']
         out_bbox = outputs['pred_boxes']
         out_keypoints = outputs.get('pred_keypoints', None)
+        out_heatmaps = outputs.get('pred_heatmaps', None)  # [B, K, H_hm, W_hm] for heatmap model
 
         # Human detection scores
         human_prob = F.softmax(out_human, -1)
@@ -645,8 +754,8 @@ class PostProcessPose(nn.Module):
         scale_fct = torch.tensor([imgsize[1], imgsize[0], imgsize[1], imgsize[0]]).to(boxes.device)
         boxes = boxes * scale_fct
 
-        # Scale keypoints to image size if available
-        if out_keypoints is not None:
+        # Scale keypoints to image size if available (regression model)
+        if out_keypoints is not None and out_heatmaps is None:
             keypoints_scaled = out_keypoints.clone()
             keypoints_scaled[..., 0] = out_keypoints[..., 0] * imgsize[1]  # x * width
             keypoints_scaled[..., 1] = out_keypoints[..., 1] * imgsize[0]  # y * height
@@ -683,6 +792,57 @@ class PostProcessPose(nn.Module):
                 keypoints_kept = keypoints_kept.clone()
                 low_conf = keypoints_kept[..., 2] < keypoint_conf
                 keypoints_kept[..., 2][low_conf] = 0
+
+            # Heatmap model: extract per-person keypoints from global heatmaps
+            if out_heatmaps is not None:
+                heatmaps_i = out_heatmaps[i]  # [K, H_hm, W_hm]
+                K, H_hm, W_hm = heatmaps_i.shape
+                img_h, img_w = imgsize
+
+                # Scale factors from image to heatmap coordinates
+                scale_x = W_hm / img_w
+                scale_y = H_hm / img_h
+
+                person_kps = []
+                for box in boxes_kept:
+                    # Clamp bbox to image bounds and convert to heatmap coords
+                    x1 = max(int(box[0].item() * scale_x), 0)
+                    y1 = max(int(box[1].item() * scale_y), 0)
+                    x2 = min(int(box[2].item() * scale_x) + 1, W_hm)
+                    y2 = min(int(box[3].item() * scale_y) + 1, H_hm)
+
+                    # Clamp to valid heatmap region
+                    x1, y1 = max(x1, 0), max(y1, 0)
+                    x2, y2 = min(x2, W_hm), min(y2, H_hm)
+
+                    kps = torch.zeros(K, 3, device=heatmaps_i.device)
+                    if x2 > x1 and y2 > y1:
+                        roi = heatmaps_i[:, y1:y2, x1:x2]  # [K, roi_h, roi_w]
+                        roi_h, roi_w = roi.shape[1], roi.shape[2]
+
+                        # Argmax within ROI
+                        roi_flat = roi.reshape(K, -1)
+                        max_vals, flat_idx = roi_flat.max(dim=-1)  # [K]
+
+                        row_idx = flat_idx // roi_w + y1
+                        col_idx = flat_idx % roi_w + x1
+
+                        # Convert back to image pixel coordinates
+                        kps[:, 0] = col_idx.float() / scale_x  # x in image space
+                        kps[:, 1] = row_idx.float() / scale_y  # y in image space
+                        kps[:, 2] = max_vals  # confidence from heatmap peak
+
+                    person_kps.append(kps)
+
+                if len(person_kps) > 0:
+                    keypoints_kept = torch.stack(person_kps, dim=0)  # [N_persons, K, 3]
+                    # Zero out low-confidence keypoints
+                    low_conf = keypoints_kept[..., 2] < keypoint_conf
+                    keypoints_kept = keypoints_kept.clone()
+                    keypoints_kept[..., 2][low_conf] = 0
+                else:
+                    # No detections: return empty tensor
+                    keypoints_kept = torch.zeros((0, K, 3), device=heatmaps_i.device)
 
             result = {
                 'scores': human_scores_kept,

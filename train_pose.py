@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from sia import get_sia_pose, get_sia_pose_simple, get_sia_pose_decoder_led, HungarianMatcher, SetCriterion, PostProcessPose
+from sia import get_sia_pose, get_sia_pose_simple, get_sia_pose_dino, get_sia_pose_dino_simple, get_sia_pose_heatmap, HungarianMatcher, SetCriterion, PostProcessPose
 from datasets import COCOPose, COCOPoseVal
 
 # Weights & Biases for experiment tracking
@@ -124,10 +124,10 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SIA for Pose Estimation on COCO")
 
     # Model
-    parser.add_argument("-MODEL", type=str, default='pose', choices=['sia_pose', 'sia_pose_simple', 'sia_pose_decoder_led'],
-                        help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_decoder_led' (DETR-style LED)")
-    parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14'],
-                        help="Model size: b16 (ViT-B/16) or l14 (ViT-L/14)")
+    parser.add_argument("-MODEL", type=str, default='pose', choices=['sia_pose', 'sia_pose_simple', 'sia_pose_heatmap', 'sia_pose_dino', 'sia_pose_dino_simple'],
+                        help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_decoder_led' (DETR-style LED), 'sia_pose_dino' (DINOv2 + LED), 'sia_pose_dino_simple' (DINOv2 encoder-only)")
+    parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14', 'dino_b14', 'dino_l14'],
+                        help="Model size: b16/l14 (ViCLIP), dino_b14/dino_l14 (DINOv2)")
     parser.add_argument("-FRAMES", type=int, default=1,
                         help="Number of input frames (image duplicated)")
     parser.add_argument("-DET", type=int, default=20,
@@ -268,12 +268,47 @@ def collate_fn(batch):
 
 def build_model(args, rank):
     """Build SIA model with pose detection."""
+    # DINOv2 models don't need ViCLIP pretrain weights
+    if args.MODEL == 'sia_pose_dino':
+        if args.SIZE == 'dino_b14':
+            dino_size = 'b'
+        elif args.SIZE == 'dino_l14':
+            dino_size = 'l'
+        else:
+            raise ValueError(f"Invalid SIZE '{args.SIZE}' for sia_pose_dino. Use 'dino_b14' or 'dino_l14'.")
+        model = get_sia_pose_dino(
+            size=dino_size,
+            det_token_num=args.DET,
+            num_frames=args.FRAMES,
+            num_keypoints=17,
+            decoder_layers=args.POSE_LAYERS,
+        )['sia']
+        return model
+
+    if args.MODEL == 'sia_pose_dino_simple':
+        if args.SIZE == 'dino_b14':
+            dino_size = 'b'
+        elif args.SIZE == 'dino_l14':
+            dino_size = 'l'
+        else:
+            raise ValueError(f"Invalid SIZE '{args.SIZE}' for sia_pose_dino_simple. Use 'dino_b14' or 'dino_l14'.")
+        model = get_sia_pose_dino_simple(
+            size=dino_size,
+            det_token_num=args.DET,
+            num_frames=args.FRAMES,
+            num_keypoints=17,
+        )['sia']
+        return model
+
+    # ViCLIP-based models
     if args.SIZE == 'b16':
         pretrain = "weights/ViCLIP-B_InternVid-FLT-10M.pth"
         size = 'b'
-    else:
+    elif args.SIZE == 'l14':
         pretrain = "weights/ViCLIP-L_InternVid-FLT-10M.pth"
         size = 'l'
+    else:
+        raise ValueError(f"Invalid SIZE '{args.SIZE}' for {args.MODEL}. Use 'b16' or 'l14'.")
 
     if not os.path.exists(pretrain):
             print(f"Warning: Pretrain weights not found at {pretrain}, training from scratch")
@@ -299,15 +334,14 @@ def build_model(args, rank):
             num_frames=args.FRAMES,
             num_keypoints=17,
         )['sia']
-    elif args.MODEL == 'sia_pose_decoder_led':
-        # Late Encoder-Decoder (LED) model: no det tokens in encoder, decoder cross-attends to spatial features
-        model = get_sia_pose_decoder_led(
+    elif args.MODEL == 'sia_pose_heatmap':
+        # ViTPose-style heatmap decoder: spatial features -> 2x Deconv -> Conv1x1 -> heatmaps
+        model = get_sia_pose_heatmap(
             size=size,
             pretrain=pretrain,
             det_token_num=args.DET,
             num_frames=args.FRAMES,
             num_keypoints=17,
-            decoder_layers=args.POSE_LAYERS,
         )['sia']
     else:
         raise ValueError(f"Unknown model type: {args.MODEL}")
@@ -317,12 +351,15 @@ def build_model(args, rank):
 
 def build_criterion(args, rank):
     """Build matcher and criterion for training."""
+    # Heatmap model: keypoint matching not applicable (global heatmaps), use bbox/human costs only
+    cost_kp = 0 if args.MODEL == 'sia_pose_heatmap' else args.COST_KP
+
     matcher = HungarianMatcher(
         cost_class=0,  # No action classes
         cost_bbox=args.W_BBOX,
         cost_giou=args.W_GIOU,
         cost_human=args.W_HUMAN,
-        cost_keypoint=args.COST_KP
+        cost_keypoint=cost_kp
     )
 
     # Include bbox and human losses so all parameters receive gradients (required for DDP)
@@ -334,11 +371,17 @@ def build_criterion(args, rank):
         'loss_human': args.W_HUMAN,
     }
 
+    # Heatmap model uses global heatmap loss instead of per-instance RLE loss
+    if args.MODEL == 'sia_pose_heatmap':
+        losses_list = ['keypoints_heatmap', 'boxes', 'human']
+    else:
+        losses_list = ['keypoints', 'boxes', 'human']
+
     criterion = SetCriterion(
         matcher=matcher,
         weight_dict=weight_dict,
-        eos_coef=0.3,
-        losses=['keypoints', 'boxes', 'human'],  # All losses for DDP compatibility
+        eos_coef=0.3, # Suppressing  false positives more
+        losses=losses_list,
         num_keypoints=17  # COCO has 17 keypoints, needed for RLE loss sigma
     )
     criterion.to(rank)
@@ -352,8 +395,13 @@ def freeze_encoder(model):
     trainable_count = 0
 
     for name, param in model.named_parameters():
-        # Keep pose decoder, keypoint heads, and pose tokens trainable
-        if 'pose_decoder' in name or 'keypoint' in name or 'pose_token' in name or 'pose_positional' in name:
+        # Keep pose/detection heads trainable, freeze backbone
+        if any(k in name for k in [
+            'pose_decoder', 'keypoint', 'pose_token', 'pose_positional',  # existing patterns
+            'led_decoder', 'human_embed', 'bbox_embed',                    # LED/DINOv2 heads
+            'temporal_positional_embedding', 'ln_post',                    # DINOv2-specific
+            'heatmap_decoder',                                             # heatmap decoder
+        ]):
             param.requires_grad = True
             trainable_count += param.numel()
         else:
@@ -428,7 +476,11 @@ def build_optimizer(model, args):
             if ('pose_decoder' in name or 'keypoint' in name or
                     'led_decoder' in name or 'human_head' in name or
                     'box_head' in name or 'det_token' in name or
-                    'det_positional' in name):
+                    'det_positional' in name or
+                    'pose_token' in name or 'pose_positional' in name or
+                    'human_embed' in name or 'bbox_embed' in name or
+                    'temporal_positional_embedding' in name or 'ln_post' in name or
+                    'heatmap_decoder' in name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
@@ -749,7 +801,7 @@ def main(args):
     if args.RESUME:
         if is_main_process():
             print(f"Resuming from {args.RESUME}", flush=True)
-        state_dict = torch.load(args.RESUME, map_location='cpu', weights_only=True)
+        state_dict = torch.load(args.RESUME, map_location='cpu', weights_only=False)
 
         # Handle temporal positional embedding mismatch (e.g. checkpoint=9 frames, model=1 frame)
         key = "vision_encoder.temporal_positional_embedding"

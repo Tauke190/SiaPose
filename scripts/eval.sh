@@ -10,7 +10,7 @@
 CHECKPOINT=${CHECKPOINT:-"output/sia_pose_simple1_frames_b16_best.pt"}
 MODEL=${MODEL:-"sia_pose_simple"}
 SIZE=${SIZE:-"b16"}
-DATASET=${DATASET:-"coco"}
+DATASET=${DATASET:-"posetrack"}
 BATCH_SIZE=${BATCH_SIZE:-64}
 WORKERS=${WORKERS:-8}
 DET_TOKENS=${DET_TOKENS:-20}

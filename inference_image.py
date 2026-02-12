@@ -20,7 +20,7 @@ DEFAULT_IMAGE_PATH = "example.jpg"
 DEFAULT_WEIGHT_PATH = "weights/model.pt"
 DEFAULT_CONF_THRESH = 0.5
 DEFAULT_KP_CONF_THRESH = 0.3
-DEFAULT_NUM_FRAMES = 9
+DEFAULT_NUM_FRAMES = 1
 DEFAULT_DET_TOKENS = 20
 DEFAULT_POSE_LAYERS = 2
 DEFAULT_IMG_SIZE = (240, 320)  # (H, W)
@@ -137,6 +137,8 @@ def parse_args():
                         help="Display the result image (requires display)")
     parser.add_argument("--no_bbox", action="store_true",
                         help="Disable bounding box visualization")
+    parser.add_argument("--amp", action="store_true",
+                        help="Use mixed precision (torch.amp) for faster inference")
     return parser.parse_args()
 
 
@@ -164,6 +166,17 @@ def main():
 
     model.to(device)
     model.eval()
+
+
+        # Print model statistics
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"    Model parameters: {total_params/1e6:.1f}M (trainable: {trainable_params/1e6:.1f}M)")
+    
+    if device.startswith("cuda"):
+        print(f"    GPU Memory: {torch.cuda.memory_allocated(device) / 1024**3:.2f} GB")
+        print(f"    GPU Name: {torch.cuda.get_device_name(device)}")
+
     print("    Model ready!")
 
     # Load image
@@ -187,14 +200,42 @@ def main():
     clip_torch = torch.tensor(np.array(clip)) / 255.0
     clip_torch = tfs(clip_torch)
 
-    # Inference
+    # Inference (measure only model forward pass)
     print(f"\n[3] Running inference...")
     outsize = (frame_height, frame_width)
     with torch.no_grad():
-        outputs = model(clip_torch.unsqueeze(0).to(device))
+        # Move input to device before timing to exclude transfer time
+        input_tensor = clip_torch.unsqueeze(0).to(device)
+        print(f"    Input shape: {input_tensor.shape} (batch, frames, channels, height, width)")
+
+
+        if device != "cpu":
+            # GPU timing using CUDA events (accurate for asynchronous ops)
+            torch.cuda.synchronize()
+            start_event = torch.cuda.Event(enable_timing=True)
+            end_event = torch.cuda.Event(enable_timing=True)
+            start_event.record()
+            if args.amp:
+                with torch.amp.autocast(device_type=device.split(':')[0], dtype=torch.float16):
+                    outputs = model(input_tensor)
+            else:
+                outputs = model(input_tensor)
+            end_event.record()
+            torch.cuda.synchronize()
+            inference_time_ms = start_event.elapsed_time(end_event)
+        else:
+            # CPU timing
+            import time
+            start_time = time.perf_counter()
+            outputs = model(input_tensor)
+            inference_time_ms = (time.perf_counter() - start_time) * 1000
+
+        # Post-process (not included in measured time)
         result = postprocess(outputs, outsize,
                              human_conf=args.conf_thresh,
                              keypoint_conf=args.kp_conf_thresh)[0]
+
+    print(f"    Inference time: {inference_time_ms:.2f} ms")
 
     # Draw predictions
     out_image = image.copy()
