@@ -353,6 +353,12 @@ class SetCriterion(nn.Module):
 
         loss_bbox = F.l1_loss(src_boxes, target_boxes, reduction='none')
 
+        # Scale-aware weighting: normalize L1 by box size so small boxes
+        # get proportionally higher gradients (prevents large-box domination)
+        box_wh = target_boxes[:, 2:].clamp(min=0.01)  # [N, 2] (w, h)
+        box_scale = box_wh.repeat(1, 2)  # [N, 4] -> (w, h, w, h) for (cx, cy, w, h)
+        loss_bbox = loss_bbox / box_scale
+
         losses = {}
         losses['loss_bbox'] = loss_bbox.sum() / num_boxes
 
@@ -392,6 +398,11 @@ class SetCriterion(nn.Module):
         # target_keypoints: [num_matched, num_keypoints, 3]
         target_keypoints = torch.cat([t['keypoints'][i] for t, (_, i) in zip(targets, indices)], dim=0)
 
+        # Get matched bounding boxes for scale-aware normalization
+        # boxes are [cx, cy, w, h] in normalized coords
+        target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        box_wh = target_boxes[:, 2:].clamp(min=0.01)  # [num_matched, 2]
+
         # Visibility mask: only compute loss for visible keypoints
         # visibility > 0 means the keypoint is labeled (0=not labeled, 1=occluded, 2=visible)
         vis_mask = target_keypoints[..., 2] > 0  # [num_matched, num_keypoints]
@@ -399,6 +410,11 @@ class SetCriterion(nn.Module):
         # === RLE Loss ===
         # Compute residuals (errors) for x and y coordinates
         residuals = torch.abs(src_keypoints[..., :2] - target_keypoints[..., :2])  # [num_matched, num_keypoints, 2]
+
+        # Scale-aware: normalize residuals by bbox dimensions so that
+        # a 10% error relative to person size produces the same loss
+        # regardless of absolute person size
+        residuals = residuals / box_wh.unsqueeze(1)  # [num_matched, 1, 2] broadcast
 
         # Get sigma from learnable log_sigma (ensures sigma > 0)
         # sigma shape: [num_keypoints] -> broadcast to [1, num_keypoints, 1]

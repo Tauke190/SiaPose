@@ -4,6 +4,7 @@ COCO Keypoints Dataset for Pose Estimation Training.
 Loads COCO person keypoint annotations and creates video-like clips
 by duplicating the image for temporal consistency with the SIA model.
 """
+import math
 import os
 import random
 import torch
@@ -108,6 +109,60 @@ class COCOPose(Dataset):
 
         # --- Augmentations (training only) ---
         if self.augment:
+            # Random scale and rotation
+            scale = random.uniform(0.65, 1.35)
+            angle = random.uniform(-40, 40)
+
+            if scale != 1.0 or angle != 0:
+                angle_rad = math.radians(angle)
+                cos_a = math.cos(angle_rad)
+                sin_a = math.sin(angle_rad)
+                cx, cy = img_w / 2.0, img_h / 2.0
+
+                # Inverse affine coefficients for PIL (output → input mapping)
+                inv_s = 1.0 / scale
+                a = cos_a * inv_s
+                b = sin_a * inv_s
+                c = cx - a * cx - b * cy
+                d = -sin_a * inv_s
+                e = cos_a * inv_s
+                f = cy - d * cx - e * cy
+
+                img = img.transform(
+                    (img_w, img_h), Image.AFFINE,
+                    (a, b, c, d, e, f),
+                    resample=Image.BILINEAR,
+                    fillcolor=(128, 128, 128),
+                )
+
+                # Forward transform keypoints
+                for kp in kps_pixel:
+                    for j in range(len(kp)):
+                        if kp[j, 2] > 0:
+                            dx, dy = kp[j, 0] - cx, kp[j, 1] - cy
+                            new_x = scale * (cos_a * dx - sin_a * dy) + cx
+                            new_y = scale * (sin_a * dx + cos_a * dy) + cy
+                            if 0 <= new_x < img_w and 0 <= new_y < img_h:
+                                kp[j, 0] = new_x
+                                kp[j, 1] = new_y
+                            else:
+                                kp[j] = [0, 0, 0]
+
+                # Forward transform bounding boxes
+                for i in range(len(boxes_pixel)):
+                    x1, y1, x2, y2 = boxes_pixel[i]
+                    corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
+                    dx = corners[:, 0] - cx
+                    dy = corners[:, 1] - cy
+                    new_x = scale * (cos_a * dx - sin_a * dy) + cx
+                    new_y = scale * (sin_a * dx + cos_a * dy) + cy
+                    boxes_pixel[i] = [
+                        max(0, float(new_x.min())),
+                        max(0, float(new_y.min())),
+                        min(img_w, float(new_x.max())),
+                        min(img_h, float(new_y.max())),
+                    ]
+
             # Random horizontal flip (p=0.5)
             if random.random() < 0.5:
                 img = img.transpose(Image.FLIP_LEFT_RIGHT)

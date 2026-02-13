@@ -174,7 +174,7 @@ def parse_args():
                         help="Weight for bbox GIoU loss")
     parser.add_argument("-W_HUMAN", type=float, default=2.0,
                         help="Weight for human classification loss")
-    parser.add_argument("-W_KP", type=float, default=5.0,
+    parser.add_argument("-W_KP", type=float, default=3.0,
                         help="Weight for keypoint RLE loss")
     parser.add_argument("-W_KP_VIS", type=float, default=1.0,
                         help="Weight for keypoint visibility loss")
