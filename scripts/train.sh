@@ -4,17 +4,22 @@ cd "$(dirname "$0")/.."
 # Disable Python output buffering so logs appear immediately
 export PYTHONUNBUFFERED=1
 
-# Multi-GPU training with torchrun (recommended)
-# Adjust --nproc_per_node to match number of GPUs
-CUDA_VISIBLE_DEVICES=2 torchrun --nproc_per_node=1 train_pose.py \
-       -MODEL sia_pose_simple -SIZE b16 \
+# Create training_logs directory if it doesn't exist
+mkdir -p training_logs
+
+# Generate log filename with timestamp
+LOG_FILE="training_logs/train_$(date +%Y%m%d_%H%M%S).log"
+
+MODEL=sia_pose_simple_dec_roi  # [sia_pose_simple, sia_pose_simple_dec, sia_pose_simple_dec_roi]
+
+CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 train_pose.py \
+       -MODEL $MODEL -SIZE b16 \
        -COCO_ROOT /mnt/SSD2/coco2017/images \
        -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
        -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
-       -BS 16 -EPOCH 50 -LR 1e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 100 -WORKERS 8 -LR_BACKBONE 1e-5 -DET 100 \
+       -BS 16 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 1000 -WORKERS 8 -LR_BACKBONE 1e-5 -DET 20 \
        -HEIGHT 480 -WIDTH 640 \
-      #  --RESUME weights/avak_b16_11.pt \
+       --RESUME weights/pose_coco/sia_pose_simple_b16_best.pt \
+       -POSE_LAYERS 3  2>&1 | tee "$LOG_FILE" 
        # --NO_TQDM 
        # --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN pose_rle_experiment
-
-# CUDA_VISIBLE_DEVICES=2 

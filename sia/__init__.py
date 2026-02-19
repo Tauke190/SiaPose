@@ -1,7 +1,9 @@
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 from .sia_pose import SIA_POSE
-from .sia_pose_simple import SIA_POSE_SIMPLE
+from .sia_pose_simple import SIA_POSE_SIMPLE, SIA_POSE_SIMPLE_DEC
+from .sia_pose_simple_roi import SIA_POSE_SIMPLE_DEC_ROI
 from .sia_pose_heatmap import SIA_POSE_HEATMAP
+
 from .sia_pose_dino_simple import SIA_POSE_DINO_SIMPLE
 from torch import nn
 import torch.nn.functional as F
@@ -57,6 +59,55 @@ def get_sia_pose_simple(size='l',
         det_token_num=det_token_num,
         num_frames=num_frames,
         num_keypoints=num_keypoints,
+    )
+    m = {'sia': sia_model}
+    return m
+
+
+def get_sia_pose_simple_dec(size='l',
+                        pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
+                        det_token_num=100,
+                        num_frames=9,
+                        num_keypoints=17,
+                        decoder_layers=3):
+    """
+    Get SIA pose model with lightweight pose decoder.
+
+    Detection tokens stay in the ViT encoder.
+    Pose tokens are processed by a lightweight decoder that cross-attends
+    to encoder spatial features.
+    """
+    sia_model = SIA_POSE_SIMPLE_DEC(
+        size=size,
+        pretrain=pretrain,
+        det_token_num=det_token_num,
+        num_frames=num_frames,
+        num_keypoints=num_keypoints,
+        decoder_layers=decoder_layers,
+    )
+    m = {'sia': sia_model}
+    return m
+
+
+def get_sia_pose_simple_dec_roi(size='l',
+                                pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
+                                det_token_num=100,
+                                num_frames=9,
+                                num_keypoints=17,
+                                decoder_layers=3):
+    """
+    Get SIA pose model with ROI-based pose decoder.
+
+    Detection tokens stay in encoder -> bboxes.
+    Pose queries cross-attend only to ROI spatial features.
+    """
+    sia_model = SIA_POSE_SIMPLE_DEC_ROI(
+        size=size,
+        pretrain=pretrain,
+        det_token_num=det_token_num,
+        num_frames=num_frames,
+        num_keypoints=num_keypoints,
+        decoder_layers=decoder_layers,
     )
     m = {'sia': sia_model}
     return m

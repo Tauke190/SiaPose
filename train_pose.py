@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from sia import get_sia_pose, get_sia_pose_simple, get_sia_pose_dino, get_sia_pose_dino_simple, get_sia_pose_heatmap, HungarianMatcher, SetCriterion, PostProcessPose
+from sia import get_sia_pose, get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_simple_dec_roi, get_sia_pose_dino, get_sia_pose_dino_simple, get_sia_pose_heatmap, HungarianMatcher, SetCriterion, PostProcessPose
 from datasets import COCOPose, COCOPoseVal
 
 # Weights & Biases for experiment tracking
@@ -124,15 +124,15 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SIA for Pose Estimation on COCO")
 
     # Model
-    parser.add_argument("-MODEL", type=str, default='pose', choices=['sia_pose', 'sia_pose_simple', 'sia_pose_heatmap', 'sia_pose_dino', 'sia_pose_dino_simple'],
-                        help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_decoder_led' (DETR-style LED), 'sia_pose_dino' (DINOv2 + LED), 'sia_pose_dino_simple' (DINOv2 encoder-only)")
+    parser.add_argument("-MODEL", type=str, default='pose', choices=['sia_pose', 'sia_pose_simple', 'sia_pose_simple_dec', 'sia_pose_simple_dec_roi', 'sia_pose_heatmap', 'sia_pose_dino', 'sia_pose_dino_simple'],
+                        help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_simple_dec' (lightweight decoder), 'sia_pose_simple_dec_roi' (ROI decoder), 'sia_pose_dino' (DINOv2 + LED), 'sia_pose_dino_simple' (DINOv2 encoder-only)")
     parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14', 'dino_b14', 'dino_l14'],
                         help="Model size: b16/l14 (ViCLIP), dino_b14/dino_l14 (DINOv2)")
     parser.add_argument("-FRAMES", type=int, default=1,
                         help="Number of input frames (image duplicated)")
     parser.add_argument("-DET", type=int, default=20,
                         help="Number of detection tokens")
-    parser.add_argument("-POSE_LAYERS", type=int, default=2,
+    parser.add_argument("-POSE_LAYERS", type=int, default=3,
                         help="Number of pose decoder layers")
     parser.add_argument("--FREEZE_BACKBONE", action="store_true",
                         help="Freeze vision encoder, train only pose heads (use with pretrained weights)")
@@ -334,6 +334,26 @@ def build_model(args, rank):
             num_frames=args.FRAMES,
             num_keypoints=17,
         )['sia']
+    elif args.MODEL == 'sia_pose_simple_dec':
+        # Lightweight decoder: pose queries cross-attend to encoder spatial features
+        model = get_sia_pose_simple_dec(
+            size=size,
+            pretrain=pretrain,
+            det_token_num=args.DET,
+            num_frames=args.FRAMES,
+            num_keypoints=17,
+            decoder_layers=args.POSE_LAYERS,
+        )['sia']
+    elif args.MODEL == 'sia_pose_simple_dec_roi':
+        # ROI-based decoder: pose queries cross-attend only to ROI features
+        model = get_sia_pose_simple_dec_roi(
+            size=size,
+            pretrain=pretrain,
+            det_token_num=args.DET,
+            num_frames=args.FRAMES,
+            num_keypoints=17,
+            decoder_layers=args.POSE_LAYERS,
+        )['sia']
     elif args.MODEL == 'sia_pose_heatmap':
         # ViTPose-style heatmap decoder: spatial features -> 2x Deconv -> Conv1x1 -> heatmaps
         model = get_sia_pose_heatmap(
@@ -401,6 +421,8 @@ def freeze_encoder(model):
             'led_decoder', 'human_embed', 'bbox_embed',                    # LED/DINOv2 heads
             'temporal_positional_embedding', 'ln_post',                    # DINOv2-specific
             'heatmap_decoder',                                             # heatmap decoder
+            'pose_decoder_module', 'pose_decoder_ln',                      # lightweight pose decoder
+            'roi_refine_layers', 'roi_refine_ln',                          # ROI refinement
         ]):
             param.requires_grad = True
             trainable_count += param.numel()
@@ -480,7 +502,9 @@ def build_optimizer(model, args):
                     'pose_token' in name or 'pose_positional' in name or
                     'human_embed' in name or 'bbox_embed' in name or
                     'temporal_positional_embedding' in name or 'ln_post' in name or
-                    'heatmap_decoder' in name):
+                    'heatmap_decoder' in name or
+                    'pose_decoder_module' in name or 'pose_decoder_ln' in name or
+                    'roi_refine_layers' in name or 'roi_refine_ln' in name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
