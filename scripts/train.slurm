@@ -47,5 +47,5 @@ torchrun --nproc_per_node=2 train_pose.py \
        -TRAIN_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_train2017.json \
        -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
        -BS 128 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 \
-       -WORKERS 12 -EXP sia_pose_simple -DET 20 -HEIGHT 480 -WIDTH 640 -POSE_LAYERS 3 \
-       --NO_TQDM --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN sia_pose_token_100_tokens
+       -WORKERS 12 -EXP sia_pose -DET 20 -HEIGHT 480 -WIDTH 640 -POSE_LAYERS 3 \
+       --NO_TQDM --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN sia_decoder_roi_100_tokens
