@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH --job-name=sia_pose_100_tokens
+#SBATCH --job-name=sia_pose_dec_20
 #SBATCH --output=ucf_output/slurm-%j.out
 #SBATCH --gres-flags=enforce-binding
 #SBATCH -p gpu
@@ -39,13 +39,13 @@ echo "========================================"
 
 cd /home/av354855/SiaPose
 
-MODEL=sia_pose_simple_dec  # [sia_pose_simple, sia_pose_simple_dec]
+MODEL=sia_pose_simple_dec  # [sia_pose_simple, sia_pose_simple_dec , sia_pose_simple_dec_roi]
 
 torchrun --nproc_per_node=2 train_pose.py \
        -MODEL $MODEL \
        -COCO_ROOT /home/c3-0/datasets/coco \
        -TRAIN_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_train2017.json \
        -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
-       -BS 128 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 \
+       -BS 64 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 \
        -WORKERS 12 -EXP sia_pose -DET 20 -HEIGHT 480 -WIDTH 640 -POSE_LAYERS 3 \
        --NO_TQDM --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN sia_decoder_roi_100_tokens
