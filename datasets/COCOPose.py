@@ -3,6 +3,8 @@ COCO Keypoints Dataset for Pose Estimation Training.
 
 Loads COCO person keypoint annotations and creates video-like clips
 by duplicating the image for temporal consistency with the SIA model.
+
+Augmentations are applied with proper coordinate transformations.
 """
 import math
 import os
@@ -10,26 +12,41 @@ import random
 import torch
 from torch.utils.data import Dataset
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageFilter
 from pycocotools.coco import COCO
 from torchvision.transforms import ColorJitter
 
 from util.box_ops import box_xyxy_to_cxcywh
 
+
 # Left/right keypoint pairs for horizontal flip (COCO 17-keypoint format)
+# 0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear
+# 5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow
+# 9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip
+# 13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle
 COCO_FLIP_PAIRS = [(1, 2), (3, 4), (5, 6), (7, 8), (9, 10), (11, 12), (13, 14), (15, 16)]
 
 
 class COCOPose(Dataset):
-    """COCO Keypoints Dataset for pose estimation.
+    """COCO Keypoints Dataset for pose estimation with proper augmentation.
+
+    Augmentations include:
+    - Random horizontal flip (with keypoint pair swapping)
+    - Random scale (mild: 0.85-1.15)
+    - Random rotation (mild: ±15 degrees)
+    - Color jitter (brightness, contrast, saturation, hue)
+    - Gaussian blur (occasional)
+
+    All spatial augmentations properly update keypoint and box coordinates.
 
     Args:
         root: Path to COCO images directory (e.g., 'coco/train2017')
-        annFile: Path to annotation file (e.g., 'coco/annotations/person_keypoints_train2017.json')
-        transforms: Torchvision transforms to apply
+        annFile: Path to annotation file
+        transforms: Final transforms (resize, normalize) - applied AFTER augmentation
         frames: Number of frames to duplicate for video input
-        min_keypoints: Minimum number of visible keypoints for a person to be included
+        min_keypoints: Minimum visible keypoints for a person to be included
         min_area: Minimum bounding box area to include
+        augment: Whether to apply training augmentations
     """
 
     def __init__(
@@ -40,7 +57,7 @@ class COCOPose(Dataset):
         frames=9,
         min_keypoints=5,
         min_area=32 * 32,
-        augment=False,
+        augment=True,
     ):
         self.root = root
         self.transforms = transforms
@@ -48,7 +65,14 @@ class COCOPose(Dataset):
         self.min_keypoints = min_keypoints
         self.min_area = min_area
         self.augment = augment
-        self.color_jitter = ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1) if augment else None
+
+        # Color augmentation (doesn't affect coordinates)
+        self.color_jitter = ColorJitter(
+            brightness=0.2,
+            contrast=0.2,
+            saturation=0.2,
+            hue=0.05
+        ) if augment else None
 
         # Load COCO annotations
         self.coco = COCO(annFile)
@@ -71,10 +95,84 @@ class COCOPose(Dataset):
             if len(valid_anns) > 0:
                 self.img_ids.append(img_id)
 
-        print(f"COCOPose: {len(self.img_ids)} images with valid person keypoints")
+        print(f"COCOPose: {len(self.img_ids)} images with valid person keypoints (augment={augment})")
 
     def __len__(self):
         return len(self.img_ids)
+
+    def _apply_scale_rotation(self, img, boxes_pixel, kps_pixel, scale, angle, img_w, img_h):
+        """Apply scale and rotation to image and coordinates."""
+        if scale == 1.0 and angle == 0:
+            return img, boxes_pixel, kps_pixel
+
+        angle_rad = math.radians(angle)
+        cos_a = math.cos(angle_rad)
+        sin_a = math.sin(angle_rad)
+        cx, cy = img_w / 2.0, img_h / 2.0
+
+        # Inverse affine coefficients for PIL (output -> input mapping)
+        inv_s = 1.0 / scale
+        a = cos_a * inv_s
+        b = sin_a * inv_s
+        c = cx - a * cx - b * cy
+        d = -sin_a * inv_s
+        e = cos_a * inv_s
+        f = cy - d * cx - e * cy
+
+        img = img.transform(
+            (img_w, img_h), Image.AFFINE,
+            (a, b, c, d, e, f),
+            resample=Image.BILINEAR,
+            fillcolor=(128, 128, 128),
+        )
+
+        # Forward transform keypoints
+        for kp in kps_pixel:
+            for j in range(len(kp)):
+                if kp[j, 2] > 0:  # Only transform visible keypoints
+                    dx, dy = kp[j, 0] - cx, kp[j, 1] - cy
+                    new_x = scale * (cos_a * dx - sin_a * dy) + cx
+                    new_y = scale * (sin_a * dx + cos_a * dy) + cy
+                    # Clamp to image bounds (don't discard - just clamp)
+                    kp[j, 0] = np.clip(new_x, 0, img_w - 1)
+                    kp[j, 1] = np.clip(new_y, 0, img_h - 1)
+
+        # Forward transform bounding boxes (transform corners, then get AABB)
+        for i in range(len(boxes_pixel)):
+            x1, y1, x2, y2 = boxes_pixel[i]
+            corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
+            dx = corners[:, 0] - cx
+            dy = corners[:, 1] - cy
+            new_x = scale * (cos_a * dx - sin_a * dy) + cx
+            new_y = scale * (sin_a * dx + cos_a * dy) + cy
+            boxes_pixel[i] = [
+                max(0, float(new_x.min())),
+                max(0, float(new_y.min())),
+                min(img_w, float(new_x.max())),
+                min(img_h, float(new_y.max())),
+            ]
+
+        return img, boxes_pixel, kps_pixel
+
+    def _apply_flip(self, img, boxes_pixel, kps_pixel, img_w):
+        """Apply horizontal flip to image and coordinates."""
+        img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+        # Flip box coordinates
+        for i in range(len(boxes_pixel)):
+            x1, y1, x2, y2 = boxes_pixel[i]
+            boxes_pixel[i] = [img_w - x2, y1, img_w - x1, y2]
+
+        # Flip keypoint coordinates and swap left/right pairs
+        for kp in kps_pixel:
+            # Flip x-coordinates for labeled keypoints
+            visible = kp[:, 2] > 0
+            kp[visible, 0] = img_w - kp[visible, 0]
+            # Swap left/right keypoint pairs
+            for l, r in COCO_FLIP_PAIRS:
+                kp[l], kp[r] = kp[r].copy(), kp[l].copy()
+
+        return img, boxes_pixel, kps_pixel
 
     def __getitem__(self, idx):
         img_id = self.img_ids[idx]
@@ -108,83 +206,32 @@ class COCOPose(Dataset):
             kps_pixel.append(kp)
 
         # --- Augmentations (training only) ---
-        if self.augment:
-            # Random scale and rotation
-            scale = random.uniform(0.65, 1.35)
-            angle = random.uniform(-40, 40)
+        if self.augment and len(boxes_pixel) > 0:
+            # 1. Random scale and rotation (mild values for stability)
+            scale = random.uniform(0.85, 1.15)
+            angle = random.uniform(-15, 15)
+            img, boxes_pixel, kps_pixel = self._apply_scale_rotation(
+                img, boxes_pixel, kps_pixel, scale, angle, img_w, img_h
+            )
 
-            if scale != 1.0 or angle != 0:
-                angle_rad = math.radians(angle)
-                cos_a = math.cos(angle_rad)
-                sin_a = math.sin(angle_rad)
-                cx, cy = img_w / 2.0, img_h / 2.0
-
-                # Inverse affine coefficients for PIL (output → input mapping)
-                inv_s = 1.0 / scale
-                a = cos_a * inv_s
-                b = sin_a * inv_s
-                c = cx - a * cx - b * cy
-                d = -sin_a * inv_s
-                e = cos_a * inv_s
-                f = cy - d * cx - e * cy
-
-                img = img.transform(
-                    (img_w, img_h), Image.AFFINE,
-                    (a, b, c, d, e, f),
-                    resample=Image.BILINEAR,
-                    fillcolor=(128, 128, 128),
+            # 2. Random horizontal flip (p=0.5)
+            if random.random() < 0.5:
+                img, boxes_pixel, kps_pixel = self._apply_flip(
+                    img, boxes_pixel, kps_pixel, img_w
                 )
 
-                # Forward transform keypoints
-                for kp in kps_pixel:
-                    for j in range(len(kp)):
-                        if kp[j, 2] > 0:
-                            dx, dy = kp[j, 0] - cx, kp[j, 1] - cy
-                            new_x = scale * (cos_a * dx - sin_a * dy) + cx
-                            new_y = scale * (sin_a * dx + cos_a * dy) + cy
-                            if 0 <= new_x < img_w and 0 <= new_y < img_h:
-                                kp[j, 0] = new_x
-                                kp[j, 1] = new_y
-                            else:
-                                kp[j] = [0, 0, 0]
+            # 3. Color jitter (safe - no coordinate changes)
+            if self.color_jitter is not None:
+                img = self.color_jitter(img)
 
-                # Forward transform bounding boxes
-                for i in range(len(boxes_pixel)):
-                    x1, y1, x2, y2 = boxes_pixel[i]
-                    corners = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]])
-                    dx = corners[:, 0] - cx
-                    dy = corners[:, 1] - cy
-                    new_x = scale * (cos_a * dx - sin_a * dy) + cx
-                    new_y = scale * (sin_a * dx + cos_a * dy) + cy
-                    boxes_pixel[i] = [
-                        max(0, float(new_x.min())),
-                        max(0, float(new_y.min())),
-                        min(img_w, float(new_x.max())),
-                        min(img_h, float(new_y.max())),
-                    ]
-
-            # Random horizontal flip (p=0.5)
-            if random.random() < 0.5:
-                img = img.transpose(Image.FLIP_LEFT_RIGHT)
-                for i in range(len(boxes_pixel)):
-                    x1, y1, x2, y2 = boxes_pixel[i]
-                    boxes_pixel[i] = [img_w - x2, y1, img_w - x1, y2]
-
-                for kp in kps_pixel:
-                    # Flip x-coordinates for labeled keypoints
-                    labeled = kp[:, 2] > 0
-                    kp[labeled, 0] = img_w - kp[labeled, 0]
-                    # Swap left/right keypoint pairs
-                    for l, r in COCO_FLIP_PAIRS:
-                        kp[l], kp[r] = kp[r].copy(), kp[l].copy()
-
-            # Color jitter
-            img = self.color_jitter(img)
+            # 4. Occasional Gaussian blur (p=0.1)
+            if random.random() < 0.1:
+                img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 1.5)))
 
         # Convert to tensor and normalize to [0, 1]
         img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0
 
-        # Apply transforms (resize, normalize)
+        # Apply final transforms (resize, normalize)
         if self.transforms is not None:
             img_tensor = self.transforms(img_tensor)
 
@@ -197,19 +244,31 @@ class COCOPose(Dataset):
 
         for i in range(len(boxes_pixel)):
             x1, y1, x2, y2 = boxes_pixel[i]
-            # Normalize to [0, 1]
-            x1 = max(0, min(1, x1 / img_w))
-            y1 = max(0, min(1, y1 / img_h))
-            x2 = max(0, min(1, x2 / img_w))
-            y2 = max(0, min(1, y2 / img_h))
 
-            box = torch.tensor([x1, y1, x2, y2])
+            # Skip invalid boxes (can happen after augmentation)
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            # Normalize to [0, 1]
+            x1_norm = max(0, min(1, x1 / img_w))
+            y1_norm = max(0, min(1, y1 / img_h))
+            x2_norm = max(0, min(1, x2 / img_w))
+            y2_norm = max(0, min(1, y2 / img_h))
+
+            # Skip tiny boxes
+            if (x2_norm - x1_norm) < 0.01 or (y2_norm - y1_norm) < 0.01:
+                continue
+
+            box = torch.tensor([x1_norm, y1_norm, x2_norm, y2_norm])
             box = box_xyxy_to_cxcywh(box)
             boxes.append(box)
 
             kp = kps_pixel[i].copy()
             kp[:, 0] = kp[:, 0] / img_w
             kp[:, 1] = kp[:, 1] / img_h
+            # Clamp normalized coordinates
+            kp[:, 0] = np.clip(kp[:, 0], 0, 1)
+            kp[:, 1] = np.clip(kp[:, 1], 0, 1)
             keypoints.append(torch.from_numpy(kp))
 
         # Stack tensors
@@ -232,8 +291,20 @@ class COCOPose(Dataset):
 class COCOPoseVal(COCOPose):
     """COCO Keypoints Dataset for validation/evaluation.
 
-    Returns original image size for proper metric computation.
+    Augmentation is disabled. Returns original image size for proper metric computation.
     """
+
+    def __init__(self, root, annFile, transforms=None, frames=9, min_keypoints=1, min_area=0):
+        # Disable augmentation for validation
+        super().__init__(
+            root=root,
+            annFile=annFile,
+            transforms=transforms,
+            frames=frames,
+            min_keypoints=min_keypoints,
+            min_area=min_area,
+            augment=False,  # No augmentation for validation
+        )
 
     def __getitem__(self, idx):
         clip, target = super().__getitem__(idx)

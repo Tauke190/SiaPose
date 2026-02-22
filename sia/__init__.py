@@ -1,5 +1,4 @@
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
-from .sia_pose import SIA_POSE
 from .sia_pose_simple import SIA_POSE_SIMPLE, SIA_POSE_SIMPLE_DEC
 from .sia_pose_simple_roi import SIA_POSE_SIMPLE_DEC_ROI
 from .sia_pose_heatmap import SIA_POSE_HEATMAP
@@ -18,29 +17,6 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized)
 from scipy.optimize import linear_sum_assignment
-
-def get_sia_pose(size='l',
-              pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
-              det_token_num=100,
-              num_frames=9,
-              # Pose detection parameters
-              num_keypoints=17,
-              pose_decoder_layers=2,
-              enable_pose=True):
-
-    sia_model = SIA_POSE(size=size,
-                        pretrain=pretrain,
-                        det_token_num=det_token_num,
-                        num_frames=num_frames,
-                        # Pose detection parameters
-                        num_keypoints=num_keypoints,
-                        pose_decoder_layers=pose_decoder_layers,
-                        enable_pose=enable_pose,
-                        )
-    m = {'sia':sia_model}
-
-    return m
-
 
 def get_sia_pose_simple(size='l',
                    pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),

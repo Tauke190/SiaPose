@@ -11,7 +11,7 @@ import cv2
 import torch
 from torchvision.transforms import v2
 from sia import (
-    get_sia_pose, get_sia_pose_simple, get_sia_pose_decoder_led,
+    get_sia_pose_simple,get_sia_pose_simple_dec,
     PostProcessPose, COCO_SKELETON, COCO_KEYPOINT_NAMES
 )
 
@@ -71,17 +71,8 @@ def build_model(args):
     else:
         size = 'l'
 
-    if args.model == 'sia_pose':
-        model = get_sia_pose(
-            size=size,
-            pretrain=None,
-            det_token_num=args.det_tokens,
-            num_frames=args.num_frames,
-            num_keypoints=17,
-            pose_decoder_layers=args.pose_layers,
-            enable_pose=True,
-        )['sia']
-    elif args.model == 'sia_pose_simple':
+
+    if args.model == 'sia_pose_simple':
         model = get_sia_pose_simple(
             size=size,
             pretrain=None,
@@ -89,8 +80,8 @@ def build_model(args):
             num_frames=args.num_frames,
             num_keypoints=17,
         )['sia']
-    elif args.model == 'sia_pose_decoder_led':
-        model = get_sia_pose_decoder_led(
+    elif args.model == 'sia_pose_simple_dec':
+        model = get_sia_pose_simple_dec(
             size=size,
             pretrain=None,
             det_token_num=args.det_tokens,

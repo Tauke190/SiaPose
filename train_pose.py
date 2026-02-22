@@ -19,7 +19,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from sia import get_sia_pose, get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_simple_dec_roi, get_sia_pose_dino, get_sia_pose_dino_simple, get_sia_pose_heatmap, HungarianMatcher, SetCriterion, PostProcessPose
+from sia import get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_simple_dec_roi, get_sia_pose_dino, get_sia_pose_dino_simple, get_sia_pose_heatmap, HungarianMatcher, SetCriterion, PostProcessPose
 from datasets import COCOPose, COCOPoseVal
 
 # Weights & Biases for experiment tracking
@@ -314,18 +314,8 @@ def build_model(args, rank):
             print(f"Warning: Pretrain weights not found at {pretrain}, training from scratch")
             pretrain = None
 
-    if args.MODEL == 'sia_pose':
-        # Original model with pose decoder
-        model = get_sia_pose(
-            size=size,
-            pretrain=pretrain,
-            det_token_num=args.DET,
-            num_frames=args.FRAMES,
-            num_keypoints=17,
-            pose_decoder_layers=args.POSE_LAYERS,
-            enable_pose=True
-        )['sia']
-    elif args.MODEL == 'sia_pose_simple':
+
+    if args.MODEL == 'sia_pose_simple':
         # Simplified model without decoder
         model = get_sia_pose_simple(
             size=size,
@@ -884,7 +874,7 @@ def main(args):
         transforms=transforms,
         frames=args.FRAMES,
         min_keypoints=args.MIN_KP,
-        augment=True,
+        augment=True,  # Enable coordinate-aware augmentation
     )
 
     # Use DistributedSampler only for multi-GPU

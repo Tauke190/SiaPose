@@ -10,14 +10,14 @@ mkdir -p training_logs
 # Generate log filename with timestamp
 LOG_FILE="training_logs/train_$(date +%Y%m%d_%H%M%S).log"
 
-MODEL=sia_pose_simple_dec_roi  # [sia_pose_simple, sia_pose_simple_dec, sia_pose_simple_dec_roi]
+MODEL=sia_pose_simple_dec  # [sia_pose_simple, sia_pose_simple_dec, sia_pose_simple_dec_roi]
 
 CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 train_pose.py \
        -MODEL $MODEL -SIZE b16 \
        -COCO_ROOT /mnt/SSD2/coco2017/images \
        -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
        -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
-       -BS 16 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 100 -WORKERS 8 -LR_BACKBONE 1e-5 -DET 20 \
+       -BS 32 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 50 -WORKERS 8 -LR_BACKBONE 1e-5 -DET 20 \
        -HEIGHT 480 -WIDTH 640 \
        --RESUME weights/pose_coco/sia_pose_simple_b16_best.pt \
        -POSE_LAYERS 3  2>&1 | tee "$LOG_FILE" 

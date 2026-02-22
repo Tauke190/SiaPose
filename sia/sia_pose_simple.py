@@ -442,14 +442,14 @@ class VisionTransformerSimpleDecoder(VisionTransformer):
 
         self.num_keypoints = num_keypoints
 
-        # Learnable pose queries (NOT appended to encoder)
+        # Learnable pose queries that SHARE positional embedding with detection tokens
+        # This ensures pose_slot[i] and det_slot[i] have the same "slot identity"
+        # so Hungarian matching supervision is consistent across both outputs
         self.pose_token_num = det_token_num
         self.pose_token = nn.Parameter(torch.zeros(self.pose_token_num, width))
         nn.init.normal_(self.pose_token, std=0.02)
-        self.pose_positional_embedding = nn.Parameter(
-            (width ** -0.5) * torch.randn(self.pose_token_num, width)
-        )
-        nn.init.normal_(self.pose_positional_embedding, std=0.02)
+        # NOTE: We use det_positional_embedding (from parent) instead of separate pose PE
+        # This is the KEY fix - pose slot i must share identity with det slot i
 
         # Lightweight pose decoder: self-attn + cross-attn + FFN per layer
         self.pose_decoder_module = nn.ModuleList([
@@ -536,8 +536,11 @@ class VisionTransformerSimpleDecoder(VisionTransformer):
         out = {'pred_logits': class_scores, 'pred_boxes': bboxes, 'human_logits': human_scores}
 
         # --- Lightweight pose decoder ---
-        pose_queries = self.pose_token + self.pose_positional_embedding  # [pose_token_num, D]
-        pose_queries = pose_queries.unsqueeze(0).expand(B, -1, -1)       # [B, N, D]
+        # Use det_positional_embedding (NOT separate pose PE) to share slot identity
+        # This ensures pose_slot[i] corresponds to det_slot[i] after Hungarian matching
+        pose_queries = self.pose_token + self.det_positional_embedding  # [pose_token_num, D]
+        # Use repeat() not expand() to allocate new memory (required for proper backprop)
+        pose_queries = pose_queries.unsqueeze(0).repeat(B, 1, 1)  # [B, N, D]
 
         for layer in self.pose_decoder_module:
             pose_queries = layer(pose_queries, spatial_features)
