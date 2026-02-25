@@ -2,7 +2,7 @@
 Standalone evaluation script for SIA Pose Estimation models.
 
 Supports:
-  - All model variants: sia_pose, sia_pose_simple, sia_pose_decoder_led
+  - All model variants: sia_pose_simple, sia_pose_decoder_led
   - Multiple datasets: COCO (default), extensible to others
   - Official COCO evaluation via pycocotools (AP, AP50, AP75, AR)
   - Custom OKS-based evaluation with per-keypoint breakdown
@@ -29,23 +29,11 @@ from torchvision.transforms import v2
 from tqdm import tqdm
 
 from sia import (
-    get_sia_pose, get_sia_pose_simple,
+    get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_simple_dec_roi,
     PostProcessPose, COCO_KEYPOINT_NAMES,
 )
 from datasets import COCOPoseVal, PoseTrackPoseVal
-
-# COCO keypoint sigmas for OKS computation (17 keypoints)
-COCO_SIGMAS = np.array([
-    0.026,                  # nose
-    0.025, 0.025,           # left_eye, right_eye
-    0.035, 0.035,           # left_ear, right_ear
-    0.079, 0.079,           # left_shoulder, right_shoulder
-    0.072, 0.072,           # left_elbow, right_elbow
-    0.062, 0.062,           # left_wrist, right_wrist
-    0.107, 0.107,           # left_hip, right_hip
-    0.087, 0.087,           # left_knee, right_knee
-    0.089, 0.089,           # left_ankle, right_ankle
-])
+from val_utils import COCO_SIGMAS, compute_oks, box_iou_np, run_coco_eval, validate_pose
 
 # PoseTrack 2017 keypoint names (15 keypoints)
 POSETRACK_KEYPOINT_NAMES = [
@@ -71,60 +59,6 @@ POSETRACK_SIGMAS = np.array([
     0.087, 0.087,           # left_knee, right_knee
     0.089, 0.089,           # left_ankle, right_ankle
 ])
-
-
-def compute_iou(box1, box2):
-    """IoU between two xyxy boxes."""
-    x1 = max(box1[0], box2[0])
-    y1 = max(box1[1], box2[1])
-    x2 = min(box1[2], box2[2])
-    y2 = min(box1[3], box2[3])
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    area1 = (box1[2] - box1[0]) * (box1[3] - box1[1])
-    area2 = (box2[2] - box2[0]) * (box2[3] - box2[1])
-    return inter / (area1 + area2 - inter + 1e-8)
-
-
-def compute_oks(pred_xy, gt_kps, gt_area, sigmas):
-    """Compute OKS between one predicted and one GT person instance.
-
-    Args:
-        pred_xy: np.array [K, 2] predicted (x, y) in original image coords
-        gt_kps:  np.array [K, 3] ground truth (x, y, v) in original image coords
-        gt_area: float, area of GT bounding box in pixels
-        sigmas:  np.array [K], per-keypoint sigma
-    Returns:
-        float OKS score in [0, 1]
-    """
-    xg, yg, vg = gt_kps[:, 0], gt_kps[:, 1], gt_kps[:, 2]
-    xd, yd = pred_xy[:, 0], pred_xy[:, 1]
-    visible = vg > 0
-    if visible.sum() == 0:
-        return 0.0
-    dx = xd - xg
-    dy = yd - yg
-    vars = (sigmas * 2) ** 2
-    e = (dx**2 + dy**2) / (2 * gt_area * vars + np.spacing(1))
-    return float(np.sum(np.exp(-e[visible])) / visible.sum())
-
-
-def box_iou_np(box_a, boxes_b):
-    """Compute IoU between one box and an array of boxes (xyxy format).
-
-    Args:
-        box_a:  np.array [4] (x1, y1, x2, y2)
-        boxes_b: np.array [M, 4]
-    Returns:
-        np.array [M] of IoU values
-    """
-    xa1 = np.maximum(box_a[0], boxes_b[:, 0])
-    ya1 = np.maximum(box_a[1], boxes_b[:, 1])
-    xa2 = np.minimum(box_a[2], boxes_b[:, 2])
-    ya2 = np.minimum(box_a[3], boxes_b[:, 3])
-    inter = np.maximum(xa2 - xa1, 0) * np.maximum(ya2 - ya1, 0)
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (boxes_b[:, 2] - boxes_b[:, 0]) * (boxes_b[:, 3] - boxes_b[:, 1])
-    return inter / (area_a + area_b - inter + np.spacing(1))
 
 
 def map_coco17_to_posetrack15(pred_kps_17):
@@ -258,24 +192,23 @@ def build_model(args):
     """Instantiate the model (without pretrained backbone weights)."""
     size = 'b' if args.size == 'b16' else 'l'
 
-    if args.model == 'sia_pose':
-        model = get_sia_pose(
-            size=size, pretrain=None,
-            det_token_num=args.det_tokens,
-            num_frames=args.num_frames,
-            num_keypoints=17,
-            pose_decoder_layers=args.pose_layers,
-            enable_pose=True,
-        )['sia']
-    elif args.model == 'sia_pose_simple':
+    if args.model == 'sia_pose_simple':
         model = get_sia_pose_simple(
             size=size, pretrain=None,
             det_token_num=args.det_tokens,
             num_frames=args.num_frames,
             num_keypoints=17,
         )['sia']
-    elif args.model == 'sia_pose_decoder_led':
-        model = get_sia_pose_decoder_led(
+    elif args.model == 'sia_pose_simple_dec':
+        model = get_sia_pose_simple_dec(
+            size=size, pretrain=None,
+            det_token_num=args.det_tokens,
+            num_frames=args.num_frames,
+            num_keypoints=17,
+            decoder_layers=args.pose_layers,
+        )['sia']
+    elif args.model == 'sia_pose_simple_dec_roi':
+        model = get_sia_pose_simple_dec_roi(
             size=size, pretrain=None,
             det_token_num=args.det_tokens,
             num_frames=args.num_frames,
@@ -286,56 +219,6 @@ def build_model(args):
         raise ValueError(f"Unknown model: {args.model}")
 
     return model
-
-
-# ---------------------------------------------------------------------------
-# Official COCO evaluation via pycocotools
-# ---------------------------------------------------------------------------
-
-def run_coco_eval(ann_file, coco_results, output_dir=None, sigmas=None):
-    """Run the official COCO keypoint evaluation.
-
-    Args:
-        ann_file: path to COCO ground-truth annotation JSON
-        coco_results: list of dicts in COCO keypoint result format
-        output_dir: if provided, save the results JSON here
-        sigmas: optional np.array of per-keypoint OKS sigmas
-                (overrides pycocotools defaults; needed for non-COCO datasets)
-
-    Returns:
-        stats dict with AP, AP50, AP75, AR, etc.
-    """
-    from pycocotools.coco import COCO
-    from pycocotools.cocoeval import COCOeval
-
-    if len(coco_results) == 0:
-        print("No predictions to evaluate.")
-        return {}
-
-    # Save predictions to temp file
-    if output_dir is not None:
-        os.makedirs(output_dir, exist_ok=True)
-        res_path = os.path.join(output_dir, 'coco_results.json')
-    else:
-        res_path = '/tmp/sia_pose_coco_results.json'
-
-    with open(res_path, 'w') as f:
-        json.dump(coco_results, f)
-
-    coco_gt = COCO(ann_file)
-    coco_dt = coco_gt.loadRes(res_path)
-
-    coco_eval = COCOeval(coco_gt, coco_dt, 'keypoints')
-    if sigmas is not None:
-        coco_eval.params.kpt_oks_sigmas = sigmas
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
-
-    names = ['AP', 'AP50', 'AP75', 'AP_M', 'AP_L', 'AR', 'AR50', 'AR75',
-             'AR_M', 'AR_L']
-    stats = {n: float(v) for n, v in zip(names, coco_eval.stats)}
-    return stats
 
 
 # ---------------------------------------------------------------------------
@@ -352,6 +235,9 @@ def evaluate(model, dataloader, postprocess, args, num_keypoints,
              sigmas, kp_map_fn=None):
     """Run inference and collect predictions in COCO result format.
 
+    Wraps val_utils.validate_pose to add dataset-specific keypoint mapping
+    and inference time tracking.
+
     Args:
         sigmas: np.array of per-keypoint OKS sigmas
         kp_map_fn: optional callable that maps model's 17 COCO keypoint
@@ -364,40 +250,55 @@ def evaluate(model, dataloader, postprocess, args, num_keypoints,
         total_inference_time: total model forward-pass time in seconds
         mean_oks: mean OKS over all matched pred-GT pairs
     """
-    model.eval()
-    device = next(model.parameters()).device
     imgsize = (args.height, args.width)
+    device = next(model.parameters()).device
+
+    # Create a wrapper dataloader that tracks inference time
+    class TimedDataLoader:
+        def __init__(self, loader):
+            self.loader = loader
+            self.total_inference_time = 0.0
+
+        def __iter__(self):
+            model_eval_time = 0.0
+            for samples, targets in self.loader:
+                samples = samples.to(device)
+
+                t0 = time.time()
+                with torch.no_grad():
+                    outputs = model(samples)
+                    results = postprocess(outputs, imgsize,
+                                        human_conf=args.conf_thresh,
+                                        keypoint_conf=args.kp_conf_thresh)
+                model_eval_time += time.time() - t0
+
+                # Apply keypoint mapping if needed
+                if kp_map_fn is not None:
+                    for result in results:
+                        if len(result['keypoints']) > 0:
+                            result['keypoints'] = kp_map_fn(result['keypoints'].cpu().numpy())
+                            result['keypoints'] = torch.from_numpy(result['keypoints'])
+
+                yield samples, targets, results
+
+            self.total_inference_time = model_eval_time
+
+    # Use shared validation logic
+    timed_loader = TimedDataLoader(dataloader)
 
     coco_results = []
-    total_inference_time = 0.0
     num_images = 0
     total_oks = 0.0
     num_oks_matched = 0
 
-    for samples, targets in tqdm(dataloader, desc="Evaluating", file=sys.stderr):
-        samples = samples.to(device)
-        bs = samples.shape[0]
-
-        t0 = time.time()
-        outputs = model(samples)
-        total_inference_time += time.time() - t0
-
-        results = postprocess(outputs, imgsize,
-                              human_conf=args.conf_thresh,
-                              keypoint_conf=args.kp_conf_thresh)
-
-        for i in range(bs):
-            result = results[i]
-            target = targets[i]
+    for _, targets, results in tqdm(timed_loader, desc="Evaluating", file=sys.stderr):
+        for result, target in zip(results, targets):
             image_id = int(target['image_id'])
             num_images += 1
 
             pred_boxes = result['boxes'].cpu().numpy().astype(float)
-            pred_kps = result['keypoints'].cpu().numpy().astype(float)
+            pred_kps = result['keypoints'].cpu().numpy().astype(float) if isinstance(result['keypoints'], torch.Tensor) else result['keypoints'].astype(float)
             pred_scores = result['scores'].cpu().numpy().astype(float)
-
-            if kp_map_fn is not None and len(pred_kps) > 0:
-                pred_kps = kp_map_fn(pred_kps)
 
             # Rescale from resized coords to original image coords
             orig_h, orig_w = target['orig_size'].tolist()
@@ -471,7 +372,8 @@ def evaluate(model, dataloader, postprocess, args, num_keypoints,
                             break
 
     mean_oks = total_oks / max(num_oks_matched, 1)
-    return coco_results, num_images, total_inference_time, mean_oks
+
+    return coco_results, num_images, timed_loader.total_inference_time, mean_oks
 
 
 # ---------------------------------------------------------------------------
@@ -488,13 +390,13 @@ def parse_args():
     p.add_argument('--checkpoint', type=str, required=True,
                    help='Path to model checkpoint (.pt)')
     p.add_argument('--model', type=str, default='sia_pose_simple',
-                   choices=['sia_pose', 'sia_pose_simple', 'sia_pose_decoder_led'],
+                   choices=['sia_pose_simple', 'sia_pose_simple_dec', 'sia_pose_simple_dec_roi'],
                    help='Model architecture')
     p.add_argument('--size', type=str, default='b16', choices=['b16', 'l14'],
                    help='Model size')
     p.add_argument('--det_tokens', type=int, default=20,
                    help='Number of detection tokens')
-    p.add_argument('--pose_layers', type=int, default=2,
+    p.add_argument('--pose_layers', type=int, default=3,
                    help='Number of pose decoder layers')
     p.add_argument('--num_frames', type=int, default=9,
                    help='Number of input frames (image duplicated)')
@@ -512,8 +414,8 @@ def parse_args():
                    help='Minimum visible keypoints per person to include')
 
     # Input
-    p.add_argument('--width', type=int, default=320, help='Input width')
-    p.add_argument('--height', type=int, default=240, help='Input height')
+    p.add_argument('--width', type=int, default=640, help='Input width')
+    p.add_argument('--height', type=int, default=480, help='Input height')
 
     # Inference
     p.add_argument('--batch_size', type=int, default=32, help='Batch size')
@@ -562,8 +464,12 @@ def main():
         print(f"ERROR: Checkpoint not found: {args.checkpoint}")
         sys.exit(1)
 
-    state_dict = torch.load(args.checkpoint, map_location='cpu', weights_only=True)
-    model.load_state_dict(state_dict, strict=False)
+    state_dict = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"      Missing keys (initialized from scratch): {missing}")
+    if unexpected:
+        print(f"      Unexpected keys (ignored): {unexpected}")
     model.to(device)
     model.eval()
     print(f"      Loaded weights from {args.checkpoint}")
@@ -601,8 +507,7 @@ def main():
     print(f"\n{'='*60}")
     print("COCO Evaluation (pycocotools)")
     print(f"{'='*60}")
-    coco_stats = run_coco_eval(ann_file, coco_results, args.output_dir,
-                               sigmas=sigmas)
+    coco_stats = run_coco_eval(ann_file, coco_results, sigmas=sigmas)
 
     metrics = {
         'num_images': num_images,

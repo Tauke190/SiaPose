@@ -5,6 +5,7 @@ Training script for SIA Pose Estimation on COCO Keypoints.
 import os
 import argparse
 import json
+import math
 import numpy as np
 import sys
 from pathlib import Path
@@ -21,6 +22,7 @@ import torch.distributed as dist
 
 from sia import get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_simple_dec_roi, get_sia_pose_dino, get_sia_pose_dino_simple, get_sia_pose_heatmap, HungarianMatcher, SetCriterion, PostProcessPose
 from datasets import COCOPose, COCOPoseVal
+from val_utils import COCO_SIGMAS, compute_oks, box_iou_np, run_coco_eval
 
 # Weights & Biases for experiment tracking
 try:
@@ -28,96 +30,6 @@ try:
     WANDB_AVAILABLE = True
 except ImportError:
     WANDB_AVAILABLE = False
-
-
-# COCO keypoint sigmas for OKS computation (17 keypoints)
-# Order: nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles
-COCO_SIGMAS = np.array([
-    0.026,  # nose
-    0.025, 0.025,  # left_eye, right_eye
-    0.035, 0.035,  # left_ear, right_ear
-    0.079, 0.079,  # left_shoulder, right_shoulder
-    0.072, 0.072,  # left_elbow, right_elbow
-    0.062, 0.062,  # left_wrist, right_wrist
-    0.107, 0.107,  # left_hip, right_hip
-    0.087, 0.087,  # left_knee, right_knee
-    0.089, 0.089,  # left_ankle, right_ankle
-])
-
-
-def compute_oks(pred_xy, gt_kps, gt_area, sigmas):
-    """Compute OKS between one predicted and one GT person instance.
-
-    Args:
-        pred_xy: np.array [K, 2] predicted (x, y) in original image coords
-        gt_kps:  np.array [K, 3] ground truth (x, y, v) in original image coords
-        gt_area: float, area of GT bounding box in pixels
-        sigmas:  np.array [K], per-keypoint sigma
-    Returns:
-        float OKS score in [0, 1]
-    """
-    xg, yg, vg = gt_kps[:, 0], gt_kps[:, 1], gt_kps[:, 2]
-    xd, yd = pred_xy[:, 0], pred_xy[:, 1]
-    visible = vg > 0
-    if visible.sum() == 0:
-        return 0.0
-    dx = xd - xg
-    dy = yd - yg
-    vars = (sigmas * 2) ** 2
-    e = (dx**2 + dy**2) / (2 * gt_area * vars + np.spacing(1))
-    return float(np.sum(np.exp(-e[visible])) / visible.sum())
-
-
-def box_iou_np(box_a, boxes_b):
-    """Compute IoU between one box and an array of boxes (xyxy format).
-
-    Args:
-        box_a:  np.array [4] (x1, y1, x2, y2)
-        boxes_b: np.array [M, 4]
-    Returns:
-        np.array [M] of IoU values
-    """
-    xa1 = np.maximum(box_a[0], boxes_b[:, 0])
-    ya1 = np.maximum(box_a[1], boxes_b[:, 1])
-    xa2 = np.minimum(box_a[2], boxes_b[:, 2])
-    ya2 = np.minimum(box_a[3], boxes_b[:, 3])
-    inter = np.maximum(xa2 - xa1, 0) * np.maximum(ya2 - ya1, 0)
-    area_a = (box_a[2] - box_a[0]) * (box_a[3] - box_a[1])
-    area_b = (boxes_b[:, 2] - boxes_b[:, 0]) * (boxes_b[:, 3] - boxes_b[:, 1])
-    return inter / (area_a + area_b - inter + np.spacing(1))
-
-
-def run_coco_eval(ann_file, coco_results, sigmas=None):
-    """Run the official COCO keypoint evaluation via pycocotools.
-
-    Returns:
-        stats dict with AP, AP50, AP75, AR, etc.
-    """
-    from pycocotools.coco import COCO
-    from pycocotools.cocoeval import COCOeval
-
-    if len(coco_results) == 0:
-        print("No predictions to evaluate.")
-        return {}
-
-    res_path = '/tmp/sia_pose_train_coco_results.json'
-    with open(res_path, 'w') as f:
-        json.dump(coco_results, f)
-
-    coco_gt = COCO(ann_file)
-    coco_dt = coco_gt.loadRes(res_path)
-
-    coco_eval = COCOeval(coco_gt, coco_dt, 'keypoints')
-    if sigmas is not None:
-        coco_eval.params.kpt_oks_sigmas = sigmas
-    coco_eval.evaluate()
-    coco_eval.accumulate()
-    coco_eval.summarize()
-
-    names = ['AP', 'AP50', 'AP75', 'AP_M', 'AP_L', 'AR', 'AR50', 'AR75',
-             'AR_M', 'AR_L']
-    stats = {n: float(v) for n, v in zip(names, coco_eval.stats)}
-    return stats
 
 
 def parse_args():
@@ -134,6 +46,10 @@ def parse_args():
                         help="Number of detection tokens")
     parser.add_argument("-POSE_LAYERS", type=int, default=3,
                         help="Number of pose decoder layers")
+    parser.add_argument("-MAX_ROI_CAP", type=int, default=0,
+                        help="(Legacy) Cap max ROI size. Unused when -ROI_SIZE > 0")
+    parser.add_argument("-ROI_SIZE", type=int, default=14,
+                        help="ROI output size P (each ROI -> PxP tokens via roi_align). 14=196 tokens, 7=49 tokens. 0=fallback to variable-length")
     parser.add_argument("--FREEZE_BACKBONE", action="store_true",
                         help="Freeze vision encoder, train only pose heads (use with pretrained weights)")
 
@@ -160,6 +76,8 @@ def parse_args():
                         help="Learning rate for backbone (lower than decoder)")
     parser.add_argument("-WEIGHT_DECAY", type=float, default=1e-4,
                         help="Weight decay")
+    parser.add_argument("-GRAD_CLIP", type=float, default=0.3,
+                        help="Gradient clipping max norm (0 = disabled)")
 
     # Input size
     parser.add_argument("-WIDTH", type=int, default=320,
@@ -191,15 +109,15 @@ def parse_args():
     parser.add_argument("--RESUME", type=str, default=None,
                         help="Path to checkpoint to resume from")
 
-    # Validation
+    # Validation & Logging
     parser.add_argument("-VAL_FREQ", type=int, default=1,
                         help="Validate every N epochs")
     parser.add_argument("-VAL_BATCH_FREQ", type=int, default=0,
                         help="Validate every N batches within an epoch (0 = disabled)")
     parser.add_argument("--NO_VAL", action='store_true',
                         help="Skip validation")
-    parser.add_argument("--NO_TQDM", action='store_true',
-                        help="Disable tqdm progress bar (useful for distributed training logs)")
+    parser.add_argument("-LOG", type=int, default=100,
+                        help="Log losses and ROI stats every N batches")
 
     # GPU
     parser.add_argument("-NGPU", type=int, default=None,
@@ -343,6 +261,8 @@ def build_model(args, rank):
             num_frames=args.FRAMES,
             num_keypoints=17,
             decoder_layers=args.POSE_LAYERS,
+            max_roi_cap=args.MAX_ROI_CAP,
+            roi_output_size=args.ROI_SIZE,
         )['sia']
     elif args.MODEL == 'sia_pose_heatmap':
         # ViTPose-style heatmap decoder: spatial features -> 2x Deconv -> Conv1x1 -> heatmaps
@@ -413,6 +333,7 @@ def freeze_encoder(model):
             'heatmap_decoder',                                             # heatmap decoder
             'pose_decoder_module', 'pose_decoder_ln',                      # lightweight pose decoder
             'roi_refine_layers', 'roi_refine_ln',                          # ROI refinement
+            'roi_pos_embed',                                               # ROI positional embedding
         ]):
             param.requires_grad = True
             trainable_count += param.numel()
@@ -494,7 +415,8 @@ def build_optimizer(model, args):
                     'temporal_positional_embedding' in name or 'ln_post' in name or
                     'heatmap_decoder' in name or
                     'pose_decoder_module' in name or 'pose_decoder_ln' in name or
-                    'roi_refine_layers' in name or 'roi_refine_ln' in name):
+                    'roi_refine_layers' in name or 'roi_refine_ln' in name or
+                    'roi_pos_embed' in name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
@@ -507,6 +429,30 @@ def build_optimizer(model, args):
     return optimizer
 
 
+def build_scheduler(optimizer, total_epochs, warmup_epochs=5):
+    """Build a learning rate scheduler with linear warmup + cosine annealing.
+
+    Args:
+        optimizer: torch optimizer
+        total_epochs: total number of training epochs
+        warmup_epochs: number of epochs for linear warmup (default: 5)
+
+    Returns:
+        scheduler object that implements warmup then cosine decay
+    """
+    def lr_lambda(epoch):
+        if epoch < warmup_epochs:
+            # Linear warmup: 0.1x to 1.0x of base LR over warmup_epochs
+            return 0.1 + 0.9 * (epoch / warmup_epochs)
+        else:
+            # Cosine annealing: 1.0x down to ~0 over remaining epochs
+            progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
+            # cos(pi * progress) goes from 1 to -1, so (1 + cos(...)) / 2 goes from 1 to 0
+            return max(1e-5, (1.0 + math.cos(math.pi * progress)) / 2)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
 def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch, rank, args, val_loader=None, postprocess=None, val_freq_batches=100, use_wandb=False):
     """Train for one epoch with periodic validation."""
     model.train()
@@ -517,14 +463,11 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
     total_train_det = 0
     batch_stats = []
     num_total_batches = len(dataloader)
-    log_freq = max(1, num_total_batches // 10)  # Log ~10 times per epoch when no tqdm
+    log_freq = args.LOG  # Log every N batches
     wandb_log_freq = max(1, num_total_batches // 50)  # Log to wandb ~50 times per epoch
 
-    # Use tqdm or simple iteration based on args
-    if args.NO_TQDM:
-        iterator = enumerate(dataloader)
-    else:
-        iterator = enumerate(tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0), file=sys.stderr))
+    # Use tqdm progress bar (disabled on non-rank-0 processes in distributed training)
+    iterator = enumerate(tqdm(dataloader, desc=f"Epoch {epoch}", disable=(rank != 0), file=sys.stderr))
 
     for batch_idx, (samples, targets) in iterator:
         optimizer.zero_grad()
@@ -546,7 +489,15 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
         # Backward
         losses.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+        
+        # Clip gradients and get norm
+        grad_norm = 0.0
+        if args.GRAD_CLIP > 0:
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.GRAD_CLIP)
+        else:
+            # Compute norm without clipping
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), float('inf'))
+        
         optimizer.step()
 
         # Track loss
@@ -564,37 +515,86 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
         # Log progress
         if rank == 0:
-            loss_str = f"loss: {loss_value:.3f}"
+            loss_str = f"loss: {loss_value:.3f} | grad_norm: {grad_norm:.4f}"
             for k, v in loss_dict.items():
                 if k in weight_dict:
                     loss_str += f" | {k}: {v.item():.3f}"
 
-            if args.NO_TQDM:
-                # Print progress periodically
-                if (batch_idx + 1) % log_freq == 0 or batch_idx == 0:
-                    print(f"  [{batch_idx + 1}/{num_total_batches}] {loss_str}", flush=True)
-            else:
-                # Update tqdm postfix - need to get pbar from iterator
-                pass  # tqdm updates automatically with postfix set below
+            # Add ROI statistics to loss string if available (handle DDP wrapping)
+            try:
+                model_obj = model.module if hasattr(model, 'module') else model
+                if hasattr(model_obj, '_last_roi_stats') and model_obj._last_roi_stats:
+                    roi_stats = model_obj._last_roi_stats
+                    if 'roi_mean' in roi_stats and 'roi_std' in roi_stats and 'padding_waste_pct' in roi_stats:
+                        loss_str += f" | roi: μ={roi_stats['roi_mean']:.1f} σ={roi_stats['roi_std']:.1f} waste={roi_stats['padding_waste_pct']:.1f}%"
+            except Exception:
+                pass  # Skip ROI stats if any error occurs
+
+            # tqdm updates automatically with postfix set below
 
             # Log to wandb periodically
             if use_wandb and (batch_idx + 1) % wandb_log_freq == 0:
                 global_step = epoch * num_total_batches + batch_idx
                 wandb_metrics = {
                     'train/loss': loss_value,
+                    'train/grad_norm': grad_norm,
                     'train/epoch': epoch + (batch_idx + 1) / num_total_batches,
                     'train/total_detections': total_train_det,
                 }
                 for k, v in loss_dict.items():
                     if k in weight_dict:
                         wandb_metrics[f'train/{k}'] = v.item()
+
+                # Log ROI statistics if available (for ROI-based models, handle DDP wrapping)
+                try:
+                    model_obj = model.module if hasattr(model, 'module') else model
+                    if hasattr(model_obj, '_last_roi_stats') and model_obj._last_roi_stats:
+                        roi_stats = model_obj._last_roi_stats
+                        wandb_metrics.update({
+                            'roi/count': roi_stats.get('roi_count', 0),
+                            'roi/mean': roi_stats.get('roi_mean', 0),
+                            'roi/std': roi_stats.get('roi_std', 0),
+                            'roi/min': roi_stats.get('roi_min', 0),
+                            'roi/max': roi_stats.get('roi_max', 0),
+                            'roi/median': roi_stats.get('roi_median', 0),
+                            'roi/max_len': roi_stats.get('max_roi_len', 0),
+                            'roi/cap': roi_stats.get('max_roi_cap', 0),
+                            'roi/capped_count': roi_stats.get('capped_count', 0),
+                            'roi/padding_waste_pct': roi_stats.get('padding_waste_pct', 0),
+                            'roi/valid_patches': roi_stats.get('valid_patches', 0),
+                            'roi/total_slots': roi_stats.get('total_slots', 0),
+                        })
+                except Exception:
+                    pass  # Skip ROI stats logging if any error occurs
+
                 wandb.log(wandb_metrics, step=global_step)
 
-        # Set postfix for tqdm (only works when using tqdm)
-        if not args.NO_TQDM and rank == 0:
+            # Log detailed losses and ROI stats to console every LOG steps
+            if (batch_idx + 1) % log_freq == 0 or batch_idx == 0:
+                log_msg = f"Epoch {epoch} [{batch_idx + 1}/{num_total_batches}] "
+                log_msg += f"loss: {loss_value:.4f} | grad_norm: {grad_norm:.4f}"
+                for k, v in loss_dict.items():
+                    if k in weight_dict:
+                        log_msg += f" | {k}: {v.item():.4f}"
+
+                # Add ROI statistics if available
+                try:
+                    model_obj = model.module if hasattr(model, 'module') else model
+                    if hasattr(model_obj, '_last_roi_stats') and model_obj._last_roi_stats:
+                        roi_stats = model_obj._last_roi_stats
+                        if 'roi_mean' in roi_stats:
+                            log_msg += f" | ROI: μ={roi_stats.get('roi_mean', 0):.1f} σ={roi_stats.get('roi_std', 0):.1f} min={roi_stats.get('roi_min', 0)} max={roi_stats.get('roi_max', 0)} waste={roi_stats.get('padding_waste_pct', 0):.1f}%"
+                except Exception:
+                    pass
+
+                if rank == 0:
+                    print(log_msg, flush=True)
+
+        # Update tqdm postfix with current loss (rank 0 only)
+        if rank == 0:
             try:
                 iterator._iterable.set_postfix_str(loss_str[:80])
-            except AttributeError:
+            except (AttributeError, TypeError):
                 pass
 
         # Validate every N batches
@@ -627,130 +627,33 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
 @torch.no_grad()
 def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_dict=None):
-    """Validate the model using official COCO evaluation (pycocotools)."""
+    """Validate the model using official COCO evaluation (pycocotools).
+
+    Wraps val_utils.validate_pose with DDP-aware COCO evaluation.
+    """
+    from val_utils import validate_pose
+
     model.eval()
-
     imgsize = (args.HEIGHT, args.WIDTH)
-    num_keypoints = 17
-    coco_results = []
-    total_gt = 0
-    total_det = 0
-    total_val_loss = 0
-    num_val_batches = 0
-    num_images = 0
-    total_oks = 0.0
-    num_oks_matched = 0
 
-    # Use tqdm or simple iteration based on args
-    if args.NO_TQDM:
-        iterator = dataloader
-        if rank == 0:
-            print("  Validating...", flush=True)
-    else:
-        iterator = tqdm(dataloader, desc="Validating", disable=(rank != 0), file=sys.stderr)
+    # Call the shared validation logic
+    val_results = validate_pose(
+        model=model,
+        dataloader=dataloader,
+        postprocess=postprocess,
+        imgsize=imgsize,
+        num_keypoints=17,
+        sigmas=COCO_SIGMAS,
+        criterion=criterion,
+    )
 
-    for samples, targets in iterator:
-        samples = samples.to(rank)
-
-        outputs = model(samples)
-        results = postprocess(outputs, imgsize, human_conf=0.5, keypoint_conf=0.3)
-
-        for result, target in zip(results, targets):
-            image_id = int(target['image_id'])
-            num_images += 1
-            total_gt += len(target['boxes'])
-
-            pred_boxes = result['boxes'].cpu().numpy().astype(float)
-            pred_kps = result['keypoints'].cpu().numpy().astype(float)
-            pred_scores = result['scores'].cpu().numpy().astype(float)
-            total_det += len(pred_boxes)
-
-            # Rescale from resized coords to original image coords
-            orig_h, orig_w = target['orig_size'].tolist()
-            scale_x = orig_w / imgsize[1]
-            scale_y = orig_h / imgsize[0]
-
-            for pi in range(len(pred_boxes)):
-                box = pred_boxes[pi]
-                kps = pred_kps[pi]
-                kps_flat = []
-                for ki in range(num_keypoints):
-                    kps_flat.extend([
-                        float(kps[ki, 0]) * scale_x,
-                        float(kps[ki, 1]) * scale_y,
-                        2 if float(kps[ki, 2]) > 0.3 else 1,
-                    ])
-                coco_results.append({
-                    'image_id': image_id,
-                    'category_id': 1,
-                    'keypoints': kps_flat,
-                    'score': float(pred_scores[pi]),
-                    'bbox': [
-                        float(box[0]) * scale_x, float(box[1]) * scale_y,
-                        float(box[2] - box[0]) * scale_x, float(box[3] - box[1]) * scale_y,
-                    ],
-                })
-
-            # Compute per-instance OKS with greedy IoU matching
-            gt_boxes_norm = target['boxes'].cpu().numpy().astype(float)  # [M, 4] cxcywh normalized
-            gt_kps_norm = target['keypoints'].cpu().numpy().astype(float)  # [M, 17, 3] normalized
-
-            if len(pred_boxes) > 0 and len(gt_boxes_norm) > 0:
-                # Convert GT boxes: normalized cxcywh -> pixel xyxy
-                gt_boxes_pixel = np.zeros_like(gt_boxes_norm)
-                gt_boxes_pixel[:, 0] = (gt_boxes_norm[:, 0] - gt_boxes_norm[:, 2] / 2) * orig_w
-                gt_boxes_pixel[:, 1] = (gt_boxes_norm[:, 1] - gt_boxes_norm[:, 3] / 2) * orig_h
-                gt_boxes_pixel[:, 2] = (gt_boxes_norm[:, 0] + gt_boxes_norm[:, 2] / 2) * orig_w
-                gt_boxes_pixel[:, 3] = (gt_boxes_norm[:, 1] + gt_boxes_norm[:, 3] / 2) * orig_h
-
-                # Convert GT keypoints to pixel coords
-                gt_kps_pixel = gt_kps_norm.copy()
-                gt_kps_pixel[:, :, 0] *= orig_w
-                gt_kps_pixel[:, :, 1] *= orig_h
-
-                # GT bbox areas (w * h in pixels)
-                gt_areas = (gt_boxes_pixel[:, 2] - gt_boxes_pixel[:, 0]) * \
-                           (gt_boxes_pixel[:, 3] - gt_boxes_pixel[:, 1])
-
-                # Pred boxes in pixel xyxy
-                pred_boxes_pixel = np.zeros((len(pred_boxes), 4))
-                pred_boxes_pixel[:, 0] = pred_boxes[:, 0] * scale_x
-                pred_boxes_pixel[:, 1] = pred_boxes[:, 1] * scale_y
-                pred_boxes_pixel[:, 2] = pred_boxes[:, 2] * scale_x
-                pred_boxes_pixel[:, 3] = pred_boxes[:, 3] * scale_y
-
-                # Greedy matching: preds sorted by score (already sorted from postprocess)
-                matched_gt = set()
-                for pi in range(len(pred_boxes_pixel)):
-                    ious = box_iou_np(pred_boxes_pixel[pi], gt_boxes_pixel)
-                    order = np.argsort(-ious)
-                    for gi in order:
-                        if gi not in matched_gt and ious[gi] > 0.0:
-                            # Compute OKS for this (pred, gt) pair
-                            pred_xy = np.stack([
-                                pred_kps[pi, :, 0] * scale_x,
-                                pred_kps[pi, :, 1] * scale_y,
-                            ], axis=1)
-                            oks = compute_oks(pred_xy, gt_kps_pixel[gi], gt_areas[gi], COCO_SIGMAS)
-                            total_oks += oks
-                            num_oks_matched += 1
-                            matched_gt.add(gi)
-                            break
-
-        # Compute validation loss if criterion provided
-        if criterion is not None and weight_dict is not None:
-            for t in targets:
-                t['boxes'] = t['boxes'].to(rank)
-                t['keypoints'] = t['keypoints'].to(rank)
-                t['labels'] = torch.zeros(len(t['boxes']), 1).to(rank)
-
-            loss_dict = criterion(outputs, targets, num_classes=1)
-            losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-            total_val_loss += losses.item()
-            num_val_batches += 1
-
-    val_loss = total_val_loss / max(num_val_batches, 1) if num_val_batches > 0 else 0.0
-    mean_oks = total_oks / max(num_oks_matched, 1)
+    coco_results = val_results['coco_results']
+    num_images = val_results['num_images']
+    total_gt = val_results['total_gt']
+    total_det = val_results['total_det']
+    mean_oks = val_results['mean_oks']
+    val_loss = val_results['val_loss']
+    num_oks_matched = val_results['num_oks_matched']
 
     # Run official COCO evaluation (only on rank 0 to avoid duplicate output)
     coco_stats = {}
@@ -856,8 +759,8 @@ def main(args):
     # Build optimizer
     optimizer = build_optimizer(model, args)
 
-    # Build scheduler
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.EPOCH, eta_min=1e-6)
+    # Build scheduler with linear warmup (5 epochs) + cosine annealing
+    scheduler = build_scheduler(optimizer, total_epochs=args.EPOCH, warmup_epochs=5)
 
     # Build datasets
     if is_main_process():
@@ -946,6 +849,7 @@ def main(args):
         print(f"Batch size: {args.BS} x {world_size} GPUs = {args.BS * world_size} effective", flush=True)
 
     best_loss = float('inf')
+    best_ap = 0.0  # Track best AP for model saving
     train_stats = []
 
     for epoch in range(args.EPOCH):
@@ -1004,11 +908,14 @@ def main(args):
                 torch.save(state_dict, ckpt_path)
                 print(f"Saved checkpoint: {ckpt_path}", flush=True)
 
-            # Save best
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                best_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_best.pt')
-                torch.save(state_dict, best_path)
+            # Save best based on AP score (only during validation)
+            if val_stats is not None and 'AP' in val_stats:
+                current_ap = val_stats['AP']
+                if current_ap > best_ap:
+                    best_ap = current_ap
+                    best_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_best.pt')
+                    torch.save(state_dict, best_path)
+                    print(f"Saved best model (AP: {best_ap:.4f}): {best_path}", flush=True)
 
     # Save final
     if args.SAVE and is_main_process():

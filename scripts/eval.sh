@@ -7,14 +7,15 @@
 # Override defaults with environment variables:
 #   CHECKPOINT=weights/my_model.pt MODEL=sia_pose bash scripts/eval.sh
 
-CHECKPOINT=${CHECKPOINT:-"output/sia_pose_simple1_frames_b16_best.pt"}
+CHECKPOINT=${CHECKPOINT:-"output/sia_pose_simple_b16_best.pt"}
 MODEL=${MODEL:-"sia_pose_simple"}
 SIZE=${SIZE:-"b16"}
 DATASET=${DATASET:-"coco"}
-BATCH_SIZE=${BATCH_SIZE:-64}
+BATCH_SIZE=${BATCH_SIZE:-16}
 WORKERS=${WORKERS:-8}
 DET_TOKENS=${DET_TOKENS:-20}
-NUM_FRAMES=${NUM_FRAMES:-1}
+NUM_FRAMES=${NUM_FRAMES:-9}
+POSE_LAYERS=${POSE_LAYERS:-3}
 
 if [ "$DATASET" = "coco" ]; then
     DATA_ROOT=${COCO_ROOT:-"/mnt/SSD2/coco2017/images"}
@@ -40,5 +41,5 @@ python val_pose.py \
     --workers "$WORKERS" \
     --det_tokens "$DET_TOKENS" \
     --num_frames "$NUM_FRAMES" \
+    --pose_layers "$POSE_LAYERS" \
     --output_dir "$OUTPUT_DIR"
-

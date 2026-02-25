@@ -1,0 +1,209 @@
+Forward Pass Flow
+Stage 0: Wrapper Entry
+SIA_POSE_SIMPLE_DEC_ROI.forward(video) → encode_vision(video) → permutes to [B, C, T, H, W] → calls VisionTransformerSimpleDecoderROI.forward(x)
+
+
+Input: x [B, 3, T=1, 480, 640]
+Stage 1: Patch Embedding (conv1)
+Line 279: x = self.conv1(x) — 3D convolution with kernel [1, 16, 16], stride [1, 16, 16]
+
+
+[B, 3, 1, 480, 640]  →  [B, 768, 1, 30, 40]
+                              D    T   H    W
+Line 280: Reshape to sequence: [B*T, H*W, D] = [B, 1200, 768]
+
+Stage 2: Positional Embeddings
+Spatial PE (lines 283-294):
+
+Prepend [CLS] token → [B, 1201, 768]
+Add interpolated spatial positional embedding (initialized for 224×224, interpolated to 30×40)
+Temporal PE (lines 297-306):
+
+Strip [CLS], rearrange to (B*1200, T, 768)
+Since T=1: add temporal_positional_embedding.mean(1) (collapses temporal dim)
+Rearrange back to [B, 1200, 768]
+Stage 3: Append Detection Tokens
+Lines 312-315: Create 20 detection tokens
+
+
+det_tokens = det_token [20, 768] + det_positional_embedding [20, 768]
+           → expand to [B, 20, 768]
+
+Concatenate: [B, 1200, 768] + [B, 20, 768] = [B, 1220, 768]
+Stage 4: ViT Encoder (12 Transformer Layers)
+Lines 317-320:
+
+
+ln_pre → permute to [1220, B, 768] (seq-first)
+       → 12 × TransformerBlock(self-attn + FFN)
+       → ln_post
+
+All 1220 tokens (1200 spatial + 20 det) attend to each other.
+Stage 5: Split Encoder Output
+Lines 323-327:
+
+
+spatial_features = first 1200 tokens → [B, 1200, 768]   (image patches)
+det_x            = last 20 tokens    → [B, 20, 768]     (detection queries)
+Stage 6: Detection Heads (parallel)
+Lines 330-340:
+
+
+det_x [B, 20, 768]
+  ├─→ bbox_embed (3-layer MLP + sigmoid) → pred_boxes  [B, 20, 4]  (cx, cy, w, h ∈ [0,1])
+  ├─→ human_embed (3-layer MLP)          → human_logits [B, 20, 2]  (human / no-human)
+  └─→ proj (linear)                      → pred_logits  [B, 20, 512]
+Both bbox_embed and human_embed use gradient checkpointing to save memory.
+
+Stage 7: ROI Feature Extraction (roi_align)
+Lines 345-357 — extract_roi_features_aligned():
+
+
+spatial_features [B, 1200, 768]
+       │
+       ▼
+  reshape to NCHW: [B, 768, 30, 40]     ← feature map in patch-space
+       │
+       ▼
+  pred_boxes [B, 20, 4] (detached)
+       │  convert (cx,cy,w,h) normalized → (x1,y1,x2,y2) in patch coords
+       │  add 10% bbox padding
+       │  prepend batch_index → rois [B*20, 5]
+       │
+       ▼
+  torchvision.ops.roi_align(
+      input     = feat_map [B, 768, 30, 40],
+      boxes     = rois [B*20, 5],
+      output_size = (14, 14),
+      spatial_scale = 1.0,     ← coords already in patch-space
+      aligned = True
+  )
+       │
+       ▼
+  roi_out [B*20, 768, 14, 14]
+       │  reshape + permute
+       ▼
+  roi_features [B, 20, 196, 768]     ← FIXED size, zero padding
+
+  + roi_pos_embed [196, 768]          ← learnable 2D positional embedding
+       │
+       ▼
+  roi_features [B, 20, 196, 768]     (with spatial position info)
+Key: roi_mask = None (no padding needed) → FlashAttention enabled downstream.
+
+Stage 8: Pose Query Initialization
+Lines 364-365:
+
+
+pose_queries = pose_token [20, 768] + det_positional_embedding [20, 768]
+             → repeat to [B, 20, 768]
+
+(Shares positional identity with det tokens so slot i aligns after Hungarian matching)
+Stage 9: ROI Pose Decoder (3 layers)
+Lines 373-376 — Each ROIPoseDecoderLayer:
+
+
+For each of 3 decoder layers:
+  ┌─────────────────────────────────────────────────────────┐
+  │  1. Self-Attention (global, across all 20 queries)      │
+  │     q = LayerNorm(queries)                              │
+  │     queries += MultiheadAttention(q, q, q)              │
+  │     Shape: [B, 20, 768] → [B, 20, 768]                 │
+  │                                                         │
+  │  2. Cross-Attention (per-detection, each query → ROI)   │
+  │     q = LayerNorm(queries)                              │
+  │     Reshape: q → [B*20, 1, 768]                         │
+  │              kv → [B*20, 196, 768]                      │
+  │              mask = None → FlashAttention ✓              │
+  │     queries += MultiheadAttention(q, kv, kv)            │
+  │     Reshape back: [B*20, 1, 768] → [B, 20, 768]        │
+  │                                                         │
+  │  3. FFN                                                 │
+  │     queries += FFN(LayerNorm(queries))                  │
+  │     FFN: Linear(768→3072) → GELU → Linear(3072→768)    │
+  └─────────────────────────────────────────────────────────┘
+
+pose_x = LayerNorm(final_queries)  [B, 20, 768]
+Each query attends to only its own 196 ROI tokens (person-specific spatial features), not the full 1200 patches. The B*20 cross-attention calls are batched into a single nn.MultiheadAttention call with no mask.
+
+Stage 10: Keypoint Heads
+Lines 378-391:
+
+
+pose_x [B, 20, 768]
+    │
+    ▼
+keypoint_proj (Linear 768 → 17*768)
+    │
+    ▼
+kp_features [B, 20, 17, 768]     ← one feature vector per keypoint
+    │
+    ├──→ simple_keypoint_xy_head (3-layer MLP: 768→768→768→2 + sigmoid)
+    │         → keypoints_xy [B, 20, 17, 2]      (x, y ∈ [0,1] normalized)
+    │
+    └──→ simple_keypoint_vis_head (2-layer MLP: 768→384→1 + sigmoid)
+              → keypoints_vis [B, 20, 17, 1]      (visibility ∈ [0,1])
+
+pred_keypoints = cat([xy, vis]) → [B, 20, 17, 3]
+Final Output Dict
+
+{
+    'pred_logits':    [B, 20, 512],   # action class scores (unused for pose-only)
+    'pred_boxes':     [B, 20, 4],     # bounding boxes (cx, cy, w, h) normalized
+    'human_logits':   [B, 20, 2],     # human detection scores
+    'pred_keypoints': [B, 20, 17, 3], # keypoints (x, y, visibility) normalized
+}
+Data Flow Diagram
+
+Input [B, 3, 1, 480, 640]
+          │
+     ┌────▼─────┐
+     │  conv1    │  Patch embedding (16×16 patches)
+     │  (3D conv)│
+     └────┬──────┘
+          │ [B, 1200, 768]
+     ┌────▼─────┐
+     │ + CLS    │  Spatial + Temporal positional embeddings
+     │ + Pos PE │
+     │ + Tmp PE │
+     └────┬──────┘
+          │ [B, 1200, 768]
+     ┌────▼──────────┐
+     │ + 20 DET      │  Append detection tokens
+     │   tokens      │
+     └────┬──────────┘
+          │ [B, 1220, 768]
+     ┌────▼──────────┐
+     │  ViT Encoder  │  12 transformer layers (self-attn + FFN)
+     │  (12 layers)  │
+     └──┬────────┬───┘
+        │        │
+   spatial    det_x
+  [B,1200,768] [B,20,768]
+        │        │
+        │   ┌────▼──────┐
+        │   │ Det Heads  │  bbox_embed → boxes, human_embed → scores
+        │   └────┬───┬──┘
+        │    boxes   human
+        │  [B,20,4] [B,20,2]
+        │        │
+   ┌────▼────────▼───┐
+   │    roi_align     │  CUDA kernel: bilinear pool to 14×14
+   │  (single call)   │
+   └────────┬────────┘
+            │ [B, 20, 196, 768]
+   ┌────────▼────────┐
+   │ + roi_pos_embed │  Learnable 2D position for ROI grid
+   └────────┬────────┘
+            │
+   ┌────────▼────────┐
+   │  Pose Decoder   │  3 layers × (self-attn + cross-attn + FFN)
+   │  (3 layers)     │  query: [B,20,768], kv: [B,20,196,768]
+   │  FlashAttn ✓    │  mask=None → FlashAttention enabled
+   └────────┬────────┘
+            │ [B, 20, 768]
+   ┌────────▼────────┐
+   │ Keypoint Heads  │  Linear → 17 per-kp features → MLP → (x,y,vis)
+   └────────┬────────┘
+            │
+     pred_keypoints [B, 20, 17, 3]

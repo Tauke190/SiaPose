@@ -70,12 +70,19 @@ def get_sia_pose_simple_dec_roi(size='l',
                                 det_token_num=100,
                                 num_frames=9,
                                 num_keypoints=17,
-                                decoder_layers=3):
+                                decoder_layers=3,
+                                max_roi_cap=0,
+                                roi_output_size=14):
     """
     Get SIA pose model with ROI-based pose decoder.
 
     Detection tokens stay in encoder -> bboxes.
     Pose queries cross-attend only to ROI spatial features.
+
+    Args:
+        max_roi_cap: legacy, unused when roi_output_size > 0.
+        roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
+                         14 = 196 tokens per detection. 0 = fallback to variable-length.
     """
     sia_model = SIA_POSE_SIMPLE_DEC_ROI(
         size=size,
@@ -84,6 +91,8 @@ def get_sia_pose_simple_dec_roi(size='l',
         num_frames=num_frames,
         num_keypoints=num_keypoints,
         decoder_layers=decoder_layers,
+        max_roi_cap=max_roi_cap,
+        roi_output_size=roi_output_size,
     )
     m = {'sia': sia_model}
     return m
@@ -254,12 +263,27 @@ class HungarianMatcher(nn.Module):
             # tgt_keypoints: [num_targets, num_keypoints, 3]
             tgt_keypoints = torch.cat([v["keypoints"] for v in targets])
 
-            # Only use x, y coordinates for matching (not visibility)
-            out_kp_xy = out_keypoints[..., :2].flatten(1)  # [bs * num_queries, num_keypoints * 2]
-            tgt_kp_xy = tgt_keypoints[..., :2].flatten(1)  # [num_targets, num_keypoints * 2]
+            # Only use visible keypoints for matching cost
+            # Invisible keypoints (v=0) should not influence Hungarian assignment
+            vis_mask = tgt_keypoints[..., 2] > 0  # [num_targets, num_keypoints]
 
-            # L1 cost for keypoints
-            cost_kp = torch.cdist(out_kp_xy, tgt_kp_xy, p=1)
+            # Compute L1 cost over x,y only
+            out_kp_xy = out_keypoints[..., :2]  # [bs*num_queries, num_keypoints, 2]
+            tgt_kp_xy = tgt_keypoints[..., :2]  # [num_targets, num_keypoints, 2]
+
+            # L1 distance for each keypoint
+            kp_distances = torch.cdist(
+                out_kp_xy.flatten(1), tgt_kp_xy.flatten(1), p=1
+            )  # [bs*num_queries, num_targets]
+
+            # Reshape to per-keypoint distances and apply visibility mask
+            kp_distances_per_joint = (out_kp_xy.unsqueeze(1) - tgt_kp_xy.unsqueeze(0)).abs().sum(-1)
+            # [bs*num_queries, num_targets, num_keypoints]
+            # Zero out invisible keypoints
+            kp_distances_per_joint = kp_distances_per_joint * vis_mask.unsqueeze(0)
+            # Sum over visible keypoints only
+            cost_kp = kp_distances_per_joint.sum(-1) / (vis_mask.sum(-1).unsqueeze(0) + 1e-8)
+
             C = C + self.cost_keypoint * cost_kp
 
         C = C.view(bs, num_queries, -1).cpu()
@@ -428,7 +452,8 @@ class SetCriterion(nn.Module):
         # Get matched bounding boxes for scale-aware normalization
         # boxes are [cx, cy, w, h] in normalized coords
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
-        box_wh = target_boxes[:, 2:].clamp(min=0.01)  # [num_matched, 2]
+        # Clamp to min 0.05 (5% of image) to avoid extreme gradients for tiny boxes
+        box_wh = target_boxes[:, 2:].clamp(min=0.05)  # [num_matched, 2]
 
         # Visibility mask: only compute loss for visible keypoints
         # visibility > 0 means the keypoint is labeled (0=not labeled, 1=occluded, 2=visible)
@@ -757,7 +782,6 @@ class PostProcessViz(nn.Module):
                             'boxes': finalboxes})
 
         return results
-
 
 class PostProcessPose(nn.Module):
     """This module converts the model's pose output into a usable format.

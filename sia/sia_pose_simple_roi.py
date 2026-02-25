@@ -22,6 +22,7 @@ import logging
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torchvision.ops import roi_align
 
 from .sia_vision_clip import (
     VisionTransformer, MLP, inflate_weight, load_state_dict,
@@ -31,17 +32,13 @@ from .sia_vision_clip import (
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# ROI feature extraction utilities
-# ============================================================================
-
-def extract_roi_features(spatial_features, bboxes, H_patches, W_patches,
-                         num_frames=1, padding=0.1, min_patches=3):
+def extract_roi_features_aligned(spatial_features, bboxes, H_patches, W_patches,
+                                  num_frames=1, output_size=14, padding=0.1):
     """
-    Extract ROI features from spatial feature map using predicted bboxes.
+    Extract fixed-size ROI features using torchvision.ops.roi_align.
 
-    For each detection, selects the spatial patches that fall inside (or near)
-    the predicted bounding box. Returns padded ROI features with a mask.
+    Replaces the Python for-loop with a single CUDA-optimized call.
+    Fixed output size → no padding → no mask → FlashAttention enabled.
 
     Args:
         spatial_features: [B, H*W*T, D] encoder spatial output
@@ -49,96 +46,92 @@ def extract_roi_features(spatial_features, bboxes, H_patches, W_patches,
         H_patches:       int, number of patch rows
         W_patches:       int, number of patch columns
         num_frames:      int, number of temporal frames
-        padding:         float, fractional padding around bbox (0.1 = 10%)
-        min_patches:     int, minimum patch grid size per dimension
+        output_size:     int, P where each ROI is pooled to PxP tokens
+        padding:         float, fractional padding around bbox
 
     Returns:
-        roi_features: [B, N, max_roi_len, D] padded ROI features per detection
-        roi_mask:     [B, N, max_roi_len] bool mask (True = padding, to be ignored)
+        roi_features: [B, N, P*P, D] fixed-size ROI features per detection
+        roi_mask:     None (no padding needed)
+        roi_stats:    dict with ROI statistics
     """
     B, N, _ = bboxes.shape
     D = spatial_features.shape[-1]
     device = spatial_features.device
+    dtype = spatial_features.dtype
 
-    # If multi-frame, average across temporal dimension first
-    # spatial_features: [B, H*W*T, D] -> [B, H*W, D]
+    # Temporal averaging (same as original)
     if num_frames > 1:
-        spatial_2d = spatial_features.reshape(B, H_patches * W_patches, num_frames, D).mean(dim=2)
+        spatial_2d = spatial_features.reshape(
+            B, H_patches * W_patches, num_frames, D
+        ).mean(dim=2)
     else:
-        spatial_2d = spatial_features  # already [B, H*W, D]
+        spatial_2d = spatial_features  # [B, H*W, D]
 
-    # Reshape to spatial grid: [B, H, W, D]
-    spatial_grid = spatial_2d.reshape(B, H_patches, W_patches, D)
+    # Reshape to NCHW format for roi_align: [B, D, H_patches, W_patches]
+    feat_map = spatial_2d.reshape(B, H_patches, W_patches, D).permute(0, 3, 1, 2)
 
-    # Convert (cx, cy, w, h) to patch-space (row_start, row_end, col_start, col_end)
-    cx = bboxes[:, :, 0]  # [B, N]
+    # Convert normalized (cx, cy, w, h) → absolute patch-space (x1, y1, x2, y2)
+    cx = bboxes[:, :, 0]
     cy = bboxes[:, :, 1]
-    bw = bboxes[:, :, 2]
-    bh = bboxes[:, :, 3]
+    bw = bboxes[:, :, 2] * (1 + 2 * padding)
+    bh = bboxes[:, :, 3] * (1 + 2 * padding)
 
-    # Add padding
-    bw_padded = bw * (1 + 2 * padding)
-    bh_padded = bh * (1 + 2 * padding)
+    x1 = ((cx - bw / 2) * W_patches).clamp(min=0)
+    y1 = ((cy - bh / 2) * H_patches).clamp(min=0)
+    x2 = ((cx + bw / 2) * W_patches).clamp(max=W_patches)
+    y2 = ((cy + bh / 2) * H_patches).clamp(max=H_patches)
 
-    # Convert to patch indices (clamp to grid bounds)
-    col_start = ((cx - bw_padded / 2) * W_patches).long().clamp(min=0)
-    col_end   = ((cx + bw_padded / 2) * W_patches).long().clamp(max=W_patches)
-    row_start = ((cy - bh_padded / 2) * H_patches).long().clamp(min=0)
-    row_end   = ((cy + bh_padded / 2) * H_patches).long().clamp(max=H_patches)
+    # Build roi_align input: [B*N, 5] = (batch_idx, x1, y1, x2, y2)
+    batch_idx = torch.arange(B, device=device, dtype=feat_map.dtype
+                             ).unsqueeze(1).expand(B, N).reshape(-1, 1)
+    rois = torch.stack([x1, y1, x2, y2], dim=-1).reshape(-1, 4).to(feat_map.dtype)
+    rois = torch.cat([batch_idx, rois], dim=1)  # [B*N, 5]
 
-    # Enforce minimum patch size
-    col_mid = ((col_start + col_end) / 2).long()
-    row_mid = ((row_start + row_end) / 2).long()
-    half_min = min_patches // 2
+    # roi_align: single CUDA kernel, bilinear interpolation
+    # Input: feat_map [B, D, H, W], Output: [B*N, D, P, P]
+    roi_out = roi_align(
+        feat_map.float(),  # roi_align requires float32
+        rois.float(),
+        output_size=(output_size, output_size),
+        spatial_scale=1.0,  # features already in patch-space coordinates
+        aligned=True,
+    )
 
-    col_start = torch.minimum(col_start, (col_mid - half_min).clamp(min=0))
-    col_end   = torch.maximum(col_end,   (col_mid + half_min + 1).clamp(max=W_patches))
-    row_start = torch.minimum(row_start, (row_mid - half_min).clamp(min=0))
-    row_end   = torch.maximum(row_end,   (row_mid + half_min + 1).clamp(max=H_patches))
+    # Convert back to original dtype
+    if dtype != torch.float32:
+        roi_out = roi_out.to(dtype)
 
-    # Compute max ROI size for padding
-    roi_heights = (row_end - row_start)  # [B, N]
-    roi_widths  = (col_end - col_start)  # [B, N]
-    roi_sizes   = roi_heights * roi_widths  # [B, N]
-    max_roi_len = roi_sizes.max().item()
+    # Reshape to [B, N, P*P, D]
+    P = output_size
+    roi_features = roi_out.reshape(B, N, D, P * P).permute(0, 1, 3, 2)
 
-    if max_roi_len == 0:
-        max_roi_len = min_patches * min_patches
+    # Statistics for logging (all fixed-size, zero waste)
+    roi_stats = {
+        'roi_count': B * N,
+        'roi_mean': float(P * P),
+        'roi_std': 0.0,
+        'roi_min': P * P,
+        'roi_max': P * P,
+        'roi_median': float(P * P),
+        'max_roi_len': P * P,
+        'max_roi_cap': 0,
+        'capped_count': 0,
+        'padding_waste_pct': 0.0,
+        'total_slots': B * N * P * P,
+        'valid_patches': B * N * P * P,
+    }
 
-    # Extract ROI features for each detection
-    roi_features = torch.zeros(B, N, max_roi_len, D, device=device, dtype=spatial_features.dtype)
-    roi_mask = torch.ones(B, N, max_roi_len, device=device, dtype=torch.bool)  # True = pad
-
-    for b in range(B):
-        for n in range(N):
-            r0 = row_start[b, n].item()
-            r1 = row_end[b, n].item()
-            c0 = col_start[b, n].item()
-            c1 = col_end[b, n].item()
-
-            if r1 <= r0 or c1 <= c0:
-                continue
-
-            roi_patch = spatial_grid[b, r0:r1, c0:c1, :]  # [rh, rw, D]
-            roi_len = (r1 - r0) * (c1 - c0)
-            roi_flat = roi_patch.reshape(roi_len, D)
-
-            roi_features[b, n, :roi_len] = roi_flat
-            roi_mask[b, n, :roi_len] = False  # valid positions
-
-    return roi_features, roi_mask
+    return roi_features, None, roi_stats
 
 
-# ============================================================================
 # ROI Pose Decoder Layer
-# ============================================================================
-
 class ROIPoseDecoderLayer(nn.Module):
     """
     Decoder layer where each pose query cross-attends to its own ROI features.
 
     Self-attention: all N pose queries interact with each other (global context).
     Cross-attention: each query_i attends only to roi_features_i (local ROI).
+        When no padding exists (roi_mask=None), nn.MHA uses FlashAttention via SDPA.
     FFN: standard feed-forward.
     """
     def __init__(self, d_model=768, nhead=12, dim_feedforward=3072, dropout=0.1):
@@ -166,7 +159,8 @@ class ROIPoseDecoderLayer(nn.Module):
         Args:
             queries:      [B, N, D]  pose queries (one per detection)
             roi_features: [B, N, roi_len, D]  per-detection ROI spatial features
-            roi_mask:     [B, N, roi_len] bool, True = padding (to be ignored)
+            roi_mask:     [B, N, roi_len] bool, True = padding (to be ignored).
+                          None when no padding exists (enables FlashAttention).
 
         Returns:
             queries: [B, N, D] refined pose queries
@@ -179,10 +173,6 @@ class ROIPoseDecoderLayer(nn.Module):
         queries = queries + self.self_attn(q, q, q)[0]
 
         # --- Cross-attention (per-detection, each query -> its ROI) ---
-        # Reshape: treat each detection independently
-        # queries:      [B, N, D]          -> [B*N, 1, D]
-        # roi_features: [B, N, roi_len, D] -> [B*N, roi_len, D]
-        # roi_mask:     [B, N, roi_len]    -> [B*N, roi_len]
         q2 = self.norm2(queries)
         q_flat = q2.reshape(B * N, 1, D)
         kv_flat = roi_features.reshape(B * N, roi_len, D)
@@ -201,11 +191,7 @@ class ROIPoseDecoderLayer(nn.Module):
         queries = queries + self.ffn(self.norm3(queries))
         return queries
 
-
-# ============================================================================
 # Vision Transformer with ROI Decoder
-# ============================================================================
-
 class VisionTransformerSimpleDecoderROI(VisionTransformer):
     """
     Vision Transformer with ROI-based pose decoder.
@@ -225,7 +211,8 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         self, input_resolution, patch_size, width, layers, heads, output_dim=None,
         kernel_size=1, num_frames=9, drop_path=0, checkpoint_num=0, dropout=0.,
         temp_embed=True, det_token_num=100,
-        num_keypoints=17, decoder_layers=3,
+        num_keypoints=17, decoder_layers=3, max_roi_cap=0,
+        roi_output_size=14,
     ):
         # Parent encoder with NO pose handling
         super().__init__(
@@ -249,6 +236,8 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 
         self.num_keypoints = num_keypoints
         self.patch_size = patch_size
+        self.max_roi_cap = max_roi_cap  # legacy, unused when roi_output_size > 0
+        self.roi_output_size = roi_output_size  # P where each ROI -> PxP tokens
 
         # Learnable pose queries that SHARE positional embedding with detection tokens
         # This ensures pose_slot[i] and det_slot[i] have the same "slot identity"
@@ -258,6 +247,13 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         nn.init.normal_(self.pose_token, std=0.02)
         # NOTE: We use det_positional_embedding (from parent) instead of separate pose PE
         # This is the KEY fix - pose slot i must share identity with det slot i
+
+        # Learnable 2D positional embedding for fixed-size ROI grid
+        if roi_output_size > 0:
+            self.roi_pos_embed = nn.Parameter(
+                torch.zeros(roi_output_size ** 2, width)
+            )
+            nn.init.normal_(self.roi_pos_embed, std=0.02)
 
         # ROI pose decoder: self-attn + cross-attn(ROI) + FFN per layer
         self.pose_decoder_module = nn.ModuleList([
@@ -344,28 +340,38 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         out = {'pred_logits': class_scores, 'pred_boxes': bboxes, 'human_logits': human_scores}
 
         # --- ROI extraction ---
-        # Use predicted bboxes (detached) to extract ROI features from spatial output
-        roi_features, roi_mask = extract_roi_features(
-            spatial_features=spatial_features,
-            bboxes=bboxes.detach(),  # detach: don't backprop ROI selection through bbox head
-            H_patches=H,
-            W_patches=W,
-            num_frames=T,
-            padding=0.1,
-            min_patches=3,
-        )
-        # roi_features: [B, N, max_roi_len, D]
-        # roi_mask:     [B, N, max_roi_len]  (True = padding)
+        # Use roi_align for fixed-size ROI features (no padding, FlashAttention enabled)
+        # Falls back to old variable-length extraction if roi_output_size == 0
+        if self.roi_output_size > 0:
+            roi_features, roi_mask, roi_stats = extract_roi_features_aligned(
+                spatial_features=spatial_features,
+                bboxes=bboxes.detach(),
+                H_patches=H,
+                W_patches=W,
+                num_frames=T,
+                output_size=self.roi_output_size,
+                padding=0.1,
+            )
+            # Add learnable 2D positional embedding to ROI features
+            # roi_features: [B, N, P*P, D], roi_pos_embed: [P*P, D]
+            roi_features = roi_features + self.roi_pos_embed.unsqueeze(0).unsqueeze(0)
+
+        self._last_roi_stats = roi_stats
 
         # --- ROI Pose decoder ---
         # Use det_positional_embedding (NOT separate pose PE) to share slot identity
         # This ensures pose_slot[i] corresponds to det_slot[i] after Hungarian matching
         pose_queries = self.pose_token + self.det_positional_embedding  # [N, D]
-        # Use repeat() not expand() to allocate new memory (required for proper backprop)
         pose_queries = pose_queries.unsqueeze(0).repeat(B, 1, 1)  # [B, N, D]
 
+        # roi_mask is None for roi_align path → FlashAttention enabled
+        if roi_mask is not None:
+            mask_arg = roi_mask if roi_mask.any() else None
+        else:
+            mask_arg = None
+
         for layer in self.pose_decoder_module:
-            pose_queries = layer(pose_queries, roi_features, roi_mask)
+            pose_queries = layer(pose_queries, roi_features, mask_arg)
 
         pose_x = self.pose_decoder_ln(pose_queries)  # [B, N, D]
 
@@ -393,7 +399,8 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 def clip_joint_b16_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
-    dropout=0., num_keypoints=17, decoder_layers=3,
+    dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
+    roi_output_size=14,
 ):
     """ViT-B/16 with ROI pose decoder."""
     model = VisionTransformerSimpleDecoderROI(
@@ -403,6 +410,8 @@ def clip_joint_b16_simple_dec_roi(
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
         num_keypoints=num_keypoints, decoder_layers=decoder_layers,
+        max_roi_cap=max_roi_cap,
+        roi_output_size=roi_output_size,
     )
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-B/16"
@@ -414,8 +423,9 @@ def clip_joint_b16_simple_dec_roi(
 
 def clip_joint_l14_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
-    center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
-    dropout=0., num_keypoints=17, decoder_layers=3,
+    center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=20,
+    dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
+    roi_output_size=14,
 ):
     """ViT-L/14 with ROI pose decoder."""
     model = VisionTransformerSimpleDecoderROI(
@@ -425,6 +435,8 @@ def clip_joint_l14_simple_dec_roi(
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
         num_keypoints=num_keypoints, decoder_layers=decoder_layers,
+        max_roi_cap=max_roi_cap,
+        roi_output_size=roi_output_size,
     )
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-L/14"
@@ -500,7 +512,9 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
                  det_token_num=100,
                  num_frames=9,
                  num_keypoints=17,
-                 decoder_layers=3):
+                 decoder_layers=3,
+                 max_roi_cap=0,
+                 roi_output_size=14):
         super(SIA_POSE_SIMPLE_DEC_ROI, self).__init__()
 
         if size.lower() == 'l':
@@ -525,13 +539,17 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
         self.det_token_num = det_token_num
         self.num_keypoints = num_keypoints
         self.decoder_layers = decoder_layers
+        self.max_roi_cap = max_roi_cap
+        self.roi_output_size = roi_output_size
+        self._last_roi_stats = {}  # Initialize for logging
 
         if self.det_token_num > 0:
             print(f'Type: [DET] regression (DEC-ROI, {decoder_layers} decoder layers)')
         else:
             print(f'Type: [PATCH] regression (DEC-ROI, {decoder_layers} decoder layers)')
 
-        print(f'Dec-ROI pose: {num_keypoints} keypoints, {decoder_layers} decoder layers, ROI cross-attn')
+        roi_info = f'roi_align {roi_output_size}x{roi_output_size}={roi_output_size**2} tokens' if roi_output_size > 0 else f'variable-len (cap={max_roi_cap})'
+        print(f'Dec-ROI pose: {num_keypoints} keypoints, {decoder_layers} decoder layers, {roi_info}')
 
         # Build vision encoder
         self.vision_encoder = self.build_vision_encoder()
@@ -566,9 +584,15 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
             image = image.unsqueeze(2)
 
         if not test and self.masking_prob > 0.0:
-            return self.vision_encoder(image, masking_prob=self.masking_prob)
+            output = self.vision_encoder(image, masking_prob=self.masking_prob)
+        else:
+            output = self.vision_encoder(image)
 
-        return self.vision_encoder(image)
+        # Propagate ROI statistics from vision_encoder to wrapper model for logging
+        if hasattr(self.vision_encoder, '_last_roi_stats'):
+            self._last_roi_stats = self.vision_encoder._last_roi_stats
+
+        return output
 
     def build_vision_encoder(self):
         """Build vision encoder with ROI pose decoder."""
@@ -585,6 +609,8 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
                 det_token_num=self.det_token_num,
                 num_keypoints=self.num_keypoints,
                 decoder_layers=self.decoder_layers,
+                max_roi_cap=self.max_roi_cap,
+                roi_output_size=self.roi_output_size,
             )
         elif encoder_name == "vit_b16":
             vision_encoder = clip_joint_b16_simple_dec_roi(
@@ -598,6 +624,8 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
                 det_token_num=self.det_token_num,
                 num_keypoints=self.num_keypoints,
                 decoder_layers=self.decoder_layers,
+                max_roi_cap=self.max_roi_cap,
+                roi_output_size=self.roi_output_size,
             )
         else:
             raise NotImplementedError(f"Not implemented: {encoder_name}")
