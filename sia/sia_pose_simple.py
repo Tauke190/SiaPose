@@ -85,7 +85,12 @@ class VisionTransformerSimple(VisionTransformer):
 
         # Simple keypoint embedding per pose token
         # Projects pose_token -> num_keypoints features
-        self.keypoint_proj = nn.Linear(width, num_keypoints * width)
+        # Use 2-layer MLP instead of single linear layer for better expressiveness
+        self.keypoint_proj = nn.Sequential(
+            nn.Linear(width, width * 4),
+            nn.GELU(),
+            nn.Linear(width * 4, num_keypoints * width),
+        )
 
         # Keypoint prediction heads (same as original)
         self.simple_keypoint_xy_head = MLP(width, width, 2, 3)
@@ -464,7 +469,12 @@ class VisionTransformerSimpleDecoder(VisionTransformer):
         self.pose_decoder_ln = nn.LayerNorm(width)
 
         # Keypoint heads (same architecture as VisionTransformerSimple)
-        self.keypoint_proj = nn.Linear(width, num_keypoints * width)
+        # Use 2-layer MLP instead of single linear layer for better expressiveness
+        self.keypoint_proj = nn.Sequential(
+            nn.Linear(width, width * 4),
+            nn.GELU(),
+            nn.Linear(width * 4, num_keypoints * width),
+        )
         self.simple_keypoint_xy_head = MLP(width, width, 2, 3)
         self.simple_keypoint_vis_head = MLP(width, width // 2, 1, 2)
 
@@ -725,5 +735,3 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
             raise NotImplementedError(f"Not implemented: {encoder_name}")
 
         return vision_encoder
-
-

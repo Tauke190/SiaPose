@@ -80,9 +80,9 @@ def parse_args():
                         help="Gradient clipping max norm (0 = disabled)")
 
     # Input size
-    parser.add_argument("-WIDTH", type=int, default=320,
+    parser.add_argument("-WIDTH", type=int, default=640,
                         help="Input width")
-    parser.add_argument("-HEIGHT", type=int, default=240,
+    parser.add_argument("-HEIGHT", type=int, default=480,
                         help="Input height")
 
     # Loss weights

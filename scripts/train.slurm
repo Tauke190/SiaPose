@@ -46,7 +46,7 @@ torchrun --nproc_per_node=2 train_pose.py \
        -COCO_ROOT /home/c3-0/datasets/coco \
        -TRAIN_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_train2017.json \
        -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
-       -BS 32 -EPOCH 300 -LR 1e-4 --SAVE -FRAMES 1 \
+       -BS 32 -EPOCH 100 -LR 1e-4 --SAVE -FRAMES 1 \
        -WORKERS 12 -EXP sia_pose -DET 20 -HEIGHT 480 -WIDTH 640 -LOG 100 -POSE_LAYERS 3 -ROI_SIZE 14 \
        --RESUME weights/avak_b16_11.pt \
        --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN sia_decoder_dec_roialign_20

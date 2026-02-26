@@ -69,7 +69,12 @@ class VisionTransformerDINOSimple(nn.Module):
         self.dropout = nn.Dropout(dropout)
 
         # Keypoint projection: pose_token → num_keypoints features
-        self.keypoint_proj = nn.Linear(width, num_keypoints * width)
+        # Use 2-layer MLP instead of single linear layer for better expressiveness
+        self.keypoint_proj = nn.Sequential(
+            nn.Linear(width, width * 4),
+            nn.GELU(),
+            nn.Linear(width * 4, num_keypoints * width),
+        )
 
         # Output heads
         self.human_embed = MLP(width, width, 2, 3)
