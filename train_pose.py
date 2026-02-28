@@ -20,9 +20,21 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from sia import get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_simple_dec_roi, get_sia_pose_dino, get_sia_pose_dino_simple, get_sia_pose_heatmap, HungarianMatcher, SetCriterion, PostProcessPose
-from datasets import COCOPose, COCOPoseVal
+from sia import get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_coco, get_sia_pose_posetrack, HungarianMatcher, SetCriterion, PostProcessPose
+from datasets import COCOPose, COCOPoseVal, PoseTrackPose, PoseTrackPoseVal
 from val_utils import COCO_SIGMAS, compute_oks, box_iou_np, run_coco_eval
+
+# PoseTrack 2017 keypoint sigmas (15 keypoints)
+POSETRACK_SIGMAS = np.array([
+    0.026,              # nose
+    0.025, 0.025,       # head_bottom, head_top
+    0.079, 0.079,       # left_shoulder, right_shoulder
+    0.072, 0.072,       # left_elbow, right_elbow
+    0.062, 0.062,       # left_wrist, right_wrist
+    0.107, 0.107,       # left_hip, right_hip
+    0.087, 0.087,       # left_knee, right_knee
+    0.089, 0.089,       # left_ankle, right_ankle
+])
 
 # Weights & Biases for experiment tracking
 try:
@@ -54,12 +66,12 @@ def parse_args():
                         help="Freeze vision encoder, train only pose heads (use with pretrained weights)")
 
     # Dataset
-    parser.add_argument("-COCO_ROOT", type=str, required=True,
-                        help="Path to COCO images root (contains train2017/, val2017/)")
+    parser.add_argument("-ROOT", type=str, required=True,
+                        help="Path to dataset root (COCO: contains train2017/val2017/; PoseTrack: base directory)")
     parser.add_argument("-TRAIN_ANN", type=str, default=None,
-                        help="Path to train keypoints annotation JSON (default: COCO_ROOT/annotations/person_keypoints_train2017.json)")
+                        help="Path to train keypoints annotation JSON. Default for COCO: ROOT/annotations/person_keypoints_train2017.json. Required for PoseTrack.")
     parser.add_argument("-VAL_ANN", type=str, default=None,
-                        help="Path to val keypoints annotation JSON (default: COCO_ROOT/annotations/person_keypoints_val2017.json)")
+                        help="Path to val keypoints annotation JSON. Default for COCO: ROOT/annotations/person_keypoints_val2017.json. Required for PoseTrack.")
     parser.add_argument("-MIN_KP", type=int, default=5,
                         help="Minimum visible keypoints per person")
 
@@ -135,11 +147,19 @@ def parse_args():
 
     args = parser.parse_args()
 
-    # Set default annotation paths
-    if args.TRAIN_ANN is None:
-        args.TRAIN_ANN = os.path.join(args.COCO_ROOT, 'annotations', 'person_keypoints_train2017.json')
-    if args.VAL_ANN is None:
-        args.VAL_ANN = os.path.join(args.COCO_ROOT, 'annotations', 'person_keypoints_val2017.json')
+    # Set default annotation paths (COCO structure only)
+    # PoseTrack users must provide explicit -TRAIN_ANN and -VAL_ANN
+    if args.MODEL != 'sia_pose_posetrack':
+        if args.TRAIN_ANN is None:
+            args.TRAIN_ANN = os.path.join(args.ROOT, 'annotations', 'person_keypoints_train2017.json')
+        if args.VAL_ANN is None:
+            args.VAL_ANN = os.path.join(args.ROOT, 'annotations', 'person_keypoints_val2017.json')
+    else:
+        # PoseTrack: validate that annotation paths are provided
+        if args.TRAIN_ANN is None or args.VAL_ANN is None:
+            print("ERROR: PoseTrack model requires explicit -TRAIN_ANN and -VAL_ANN arguments", flush=True)
+            print("  Example: -TRAIN_ANN /path/to/posetrack/train.json -VAL_ANN /path/to/posetrack/val.json", flush=True)
+            sys.exit(1)
 
     return args
 
@@ -252,9 +272,9 @@ def build_model(args, rank):
             num_keypoints=17,
             decoder_layers=args.POSE_LAYERS,
         )['sia']
-    elif args.MODEL == 'sia_pose_simple_dec_roi':
+    elif args.MODEL == 'sia_pose_coco':
         # ROI-based decoder: pose queries cross-attend only to ROI features
-        model = get_sia_pose_simple_dec_roi(
+        model = get_sia_pose_coco(
             size=size,
             pretrain=pretrain,
             det_token_num=args.DET,
@@ -264,15 +284,19 @@ def build_model(args, rank):
             max_roi_cap=args.MAX_ROI_CAP,
             roi_output_size=args.ROI_SIZE,
         )['sia']
-    elif args.MODEL == 'sia_pose_heatmap':
-        # ViTPose-style heatmap decoder: spatial features -> 2x Deconv -> Conv1x1 -> heatmaps
-        model = get_sia_pose_heatmap(
+    elif args.MODEL == 'sia_pose_posetrack':
+        # ROI-based decoder: pose queries cross-attend only to ROI features
+        model = get_sia_pose_posetrack(
             size=size,
             pretrain=pretrain,
             det_token_num=args.DET,
             num_frames=args.FRAMES,
-            num_keypoints=17,
+            num_keypoints=15,
+            decoder_layers=args.POSE_LAYERS,
+            max_roi_cap=args.MAX_ROI_CAP,
+            roi_output_size=args.ROI_SIZE,
         )['sia']
+  
     else:
         raise ValueError(f"Unknown model type: {args.MODEL}")
 
@@ -307,12 +331,15 @@ def build_criterion(args, rank):
     else:
         losses_list = ['keypoints', 'boxes', 'human']
 
+    num_kp = 15 if args.MODEL == 'sia_pose_posetrack' else 17
+
+
     criterion = SetCriterion(
         matcher=matcher,
         weight_dict=weight_dict,
         eos_coef=0.3, # Suppressing  false positives more
         losses=losses_list,
-        num_keypoints=17  # COCO has 17 keypoints, needed for RLE loss sigma
+        num_keypoints=num_kp  # COCO has 17 keypoints, needed for RLE loss sigma
     )
     criterion.to(rank)
 
@@ -627,14 +654,19 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
 @torch.no_grad()
 def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_dict=None):
-    """Validate the model using official COCO evaluation (pycocotools).
+    """Validate the model using official COCO evaluation (pycocotools) or PoseTrack OKS.
 
-    Wraps val_utils.validate_pose with DDP-aware COCO evaluation.
+    Wraps val_utils.validate_pose with DDP-aware dataset-specific evaluation.
     """
     from val_utils import validate_pose
 
     model.eval()
     imgsize = (args.HEIGHT, args.WIDTH)
+
+    # Select keypoints and sigmas based on model type
+    is_posetrack = args.MODEL == 'sia_pose_posetrack'
+    num_keypoints = 15 if is_posetrack else 17
+    sigmas = POSETRACK_SIGMAS if is_posetrack else COCO_SIGMAS
 
     # Call the shared validation logic
     val_results = validate_pose(
@@ -642,8 +674,8 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
         dataloader=dataloader,
         postprocess=postprocess,
         imgsize=imgsize,
-        num_keypoints=17,
-        sigmas=COCO_SIGMAS,
+        num_keypoints=num_keypoints,
+        sigmas=sigmas,
         criterion=criterion,
     )
 
@@ -655,12 +687,14 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
     val_loss = val_results['val_loss']
     num_oks_matched = val_results['num_oks_matched']
 
-    # Run official COCO evaluation (only on rank 0 to avoid duplicate output)
+    # Run official COCO evaluation (only on rank 0, and only for COCO dataset)
     coco_stats = {}
     if rank == 0:
         print(f"Validation: {num_images} images, {total_gt} GT persons, {total_det} detections, "
               f"val_loss: {val_loss:.4f}, mean_oks: {mean_oks:.4f} ({num_oks_matched} matched)", flush=True)
-        coco_stats = run_coco_eval(args.VAL_ANN, coco_results, sigmas=COCO_SIGMAS)
+        # COCO evaluation via pycocotools (PoseTrack uses OKS metric only)
+        if not is_posetrack:
+            coco_stats = run_coco_eval(args.VAL_ANN, coco_results, sigmas=COCO_SIGMAS)
 
     return {
         'total_gt': total_gt,
@@ -771,14 +805,25 @@ def main(args):
         v2.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    train_dataset = COCOPose(
-        root=os.path.join(args.COCO_ROOT, 'train2017'),
-        annFile=args.TRAIN_ANN,
-        transforms=transforms,
-        frames=args.FRAMES,
-        min_keypoints=args.MIN_KP,
-        augment=True,  # Enable coordinate-aware augmentation
-    )
+    # Select dataset class based on model
+    is_posetrack = args.MODEL == 'sia_pose_posetrack'
+
+    if is_posetrack:
+        train_dataset = PoseTrackPose(
+            root=args.ROOT,  # PoseTrack base directory
+            annFile=args.TRAIN_ANN,
+            transforms=transforms,
+            frames=args.FRAMES,
+        )
+    else:
+        train_dataset = COCOPose(
+            root=os.path.join(args.ROOT, 'train2017'),
+            annFile=args.TRAIN_ANN,
+            transforms=transforms,
+            frames=args.FRAMES,
+            min_keypoints=args.MIN_KP,
+            augment=True,  # Enable coordinate-aware augmentation
+        )
 
     # Use DistributedSampler only for multi-GPU
     if world_size > 1:
@@ -808,13 +853,21 @@ def main(args):
     val_loader = None
     postprocess = None
     if not args.NO_VAL:
-        val_dataset = COCOPoseVal(
-            root=os.path.join(args.COCO_ROOT, 'val2017'),
-            annFile=args.VAL_ANN,
-            transforms=transforms,
-            frames=args.FRAMES,
-            min_keypoints=1  # Include more for validation
-        )
+        if is_posetrack:
+            val_dataset = PoseTrackPoseVal(
+                root=args.ROOT,  # PoseTrack base directory
+                annFile=args.VAL_ANN,
+                transforms=transforms,
+                frames=args.FRAMES,
+            )
+        else:
+            val_dataset = COCOPoseVal(
+                root=os.path.join(args.ROOT, 'val2017'),
+                annFile=args.VAL_ANN,
+                transforms=transforms,
+                frames=args.FRAMES,
+                min_keypoints=1  # Include more for validation
+            )
         if world_size > 1:
             val_sampler = DistributedSampler(val_dataset, shuffle=False)
             val_loader = DataLoader(
@@ -945,7 +998,7 @@ if __name__ == "__main__":
     # Print info
     print(f"Experiment: {args.EXP}")
     print(f"Model: {args.MODEL} ({args.SIZE})")
-    print(f"COCO root: {args.COCO_ROOT}")
+    print(f"Dataset root: {args.ROOT}")
     
     # Check if launched with torchrun
     if 'RANK' in os.environ:

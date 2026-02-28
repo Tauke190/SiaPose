@@ -1,6 +1,6 @@
 from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 from .sia_pose_simple import SIA_POSE_SIMPLE, SIA_POSE_SIMPLE_DEC
-from .sia_pose_simple_roi import SIA_POSE_SIMPLE_DEC_ROI
+from .sia_pose_coco import SIA_POSE_SIMPLE_DEC_ROI
 from .sia_pose_heatmap import SIA_POSE_HEATMAP
 
 from .sia_pose_dino_simple import SIA_POSE_DINO_SIMPLE
@@ -65,7 +65,7 @@ def get_sia_pose_simple_dec(size='l',
     return m
 
 
-def get_sia_pose_simple_dec_roi(size='l',
+def get_sia_pose_coco(size='l',
                                 pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
                                 det_token_num=100,
                                 num_frames=9,
@@ -97,83 +97,38 @@ def get_sia_pose_simple_dec_roi(size='l',
     m = {'sia': sia_model}
     return m
 
-
-def get_sia_pose_heatmap(size='l',
-                          pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
-                          det_token_num=100,
-                          num_frames=9,
-                          num_keypoints=17):
+def get_sia_pose_posetrack(size='l',
+                                pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
+                                det_token_num=100,
+                                num_frames=9,
+                                num_keypoints=15,
+                                decoder_layers=3,
+                                max_roi_cap=0,
+                                roi_output_size=14):
     """
-    Get SIA pose model with ViTPose-style heatmap decoder.
+    Get SIA pose model with ROI-based pose decoder.
 
-    Architecture:
-    - ViT Encoder with detection and pose tokens
-    - Classic deconv heatmap decoder on spatial features
-    - Global heatmap output: K = Conv1x1( Deconv( Deconv( Fout ) ) )
+    Detection tokens stay in encoder -> bboxes.
+    Pose queries cross-attend only to ROI spatial features.
+
+    Args:
+        max_roi_cap: legacy, unused when roi_output_size > 0.
+        roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
+                         14 = 196 tokens per detection. 0 = fallback to variable-length.
     """
-    sia_model = SIA_POSE_HEATMAP(
+    sia_model = SIA_POSE_SIMPLE_DEC_ROI(
         size=size,
         pretrain=pretrain,
         det_token_num=det_token_num,
         num_frames=num_frames,
         num_keypoints=num_keypoints,
-    )
-    m = {'sia': sia_model}
-    return m
-
-
-def get_sia_pose_dino(size='b',
-                      det_token_num=100,
-                      num_frames=1,
-                      num_keypoints=17,
-                      decoder_layers=3):
-    """
-    Get SIA pose model with DINOv2 backbone + LED decoder.
-
-    DINOv2 weights are loaded automatically via torch.hub (no manual pretrain path needed).
-
-    Args:
-        size: 'b' for ViT-B/14 (768d) or 'l' for ViT-L/14 (1024d)
-        det_token_num: Number of detection queries
-        num_frames: Number of input frames
-        num_keypoints: Number of keypoints (17 for COCO)
-        decoder_layers: Number of LED decoder layers
-    """
-    sia_model = SIA_POSE_DINO(
-        size=size,
-        det_token_num=det_token_num,
-        num_frames=num_frames,
-        num_keypoints=num_keypoints,
         decoder_layers=decoder_layers,
+        max_roi_cap=max_roi_cap,
+        roi_output_size=roi_output_size,
     )
     m = {'sia': sia_model}
     return m
 
-
-def get_sia_pose_dino_simple(size='b',
-                             det_token_num=100,
-                             num_frames=1,
-                             num_keypoints=17):
-    """
-    Get SIA pose model with DINOv2 backbone, encoder-only (no decoder).
-
-    Detection and pose tokens go through DINOv2's encoder alongside patch tokens.
-    Keypoints are predicted directly from pose tokens.
-
-    Args:
-        size: 'b' for ViT-B/14 (768d) or 'l' for ViT-L/14 (1024d)
-        det_token_num: Number of detection/pose queries
-        num_frames: Number of input frames
-        num_keypoints: Number of keypoints (17 for COCO)
-    """
-    sia_model = SIA_POSE_DINO_SIMPLE(
-        size=size,
-        det_token_num=det_token_num,
-        num_frames=num_frames,
-        num_keypoints=num_keypoints,
-    )
-    m = {'sia': sia_model}
-    return m
 
 
 ###################################

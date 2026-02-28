@@ -401,7 +401,7 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 # Model constructors
 # ============================================================================
 
-def clip_joint_b16_simple_dec_roi(
+def clip_joint_b16_pose_coco(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
@@ -426,7 +426,7 @@ def clip_joint_b16_simple_dec_roi(
     return model.eval()
 
 
-def clip_joint_l14_simple_dec_roi(
+def clip_joint_l14_pose_coco(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=20,
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
@@ -603,7 +603,7 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
         """Build vision encoder with ROI pose decoder."""
         encoder_name = self.vision_encoder_name
         if encoder_name == "vit_l14":
-            vision_encoder = clip_joint_l14_simple_dec_roi(
+            vision_encoder = clip_joint_l14_pose_coco(
                 pretrained=self.vision_encoder_pretrained,
                 input_resolution=self.inputs_image_res,
                 kernel_size=self.vision_encoder_kernel_size,
@@ -618,7 +618,7 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
                 roi_output_size=self.roi_output_size,
             )
         elif encoder_name == "vit_b16":
-            vision_encoder = clip_joint_b16_simple_dec_roi(
+            vision_encoder = clip_joint_b16_pose_coco(
                 pretrained=self.vision_encoder_pretrained,
                 input_resolution=self.inputs_image_res,
                 kernel_size=self.vision_encoder_kernel_size,
