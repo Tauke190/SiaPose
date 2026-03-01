@@ -68,10 +68,10 @@ class COCOPose(Dataset):
 
         # Color augmentation (doesn't affect coordinates)
         self.color_jitter = ColorJitter(
-            brightness=0.2,
-            contrast=0.2,
-            saturation=0.2,
-            hue=0.05
+            brightness=0.3,
+            contrast=0.3,
+            saturation=0.3,
+            hue=0.1
         ) if augment else None
 
         # Load COCO annotations
@@ -207,9 +207,9 @@ class COCOPose(Dataset):
 
         # --- Augmentations (training only) ---
         if self.augment and len(boxes_pixel) > 0:
-            # 1. Random scale and rotation (mild values for stability)
-            scale = random.uniform(0.85, 1.15)
-            angle = random.uniform(-15, 15)
+            # 1. Random scale and rotation (stronger values for better generalization)
+            scale = random.uniform(0.65, 1.35)
+            angle = random.uniform(-40, 40)
             img, boxes_pixel, kps_pixel = self._apply_scale_rotation(
                 img, boxes_pixel, kps_pixel, scale, angle, img_w, img_h
             )
@@ -224,9 +224,9 @@ class COCOPose(Dataset):
             if self.color_jitter is not None:
                 img = self.color_jitter(img)
 
-            # 4. Occasional Gaussian blur (p=0.1)
-            if random.random() < 0.1:
-                img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 1.5)))
+            # 4. Occasional Gaussian blur (p=0.15)
+            if random.random() < 0.15:
+                img = img.filter(ImageFilter.GaussianBlur(radius=random.uniform(0.5, 2.0)))
 
         # Convert to tensor and normalize to [0, 1]
         img_tensor = torch.from_numpy(np.array(img)).permute(2, 0, 1).float() / 255.0

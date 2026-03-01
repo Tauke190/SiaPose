@@ -375,33 +375,56 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         else:
             mask_arg = None
 
+        # Run decoder layers with intermediate supervision
+        aux_outputs = []
         for layer in self.pose_decoder_module:
             pose_queries = layer(pose_queries, roi_features, mask_arg)
+            # Store intermediate outputs for auxiliary losses
+            aux_outputs.append(self._predict_keypoints(
+                self.pose_decoder_ln(pose_queries), bboxes
+            ))
 
-        pose_x = self.pose_decoder_ln(pose_queries)  # [B, N, D]
+        # Final output uses the last aux_output (already computed)
+        final_kp_out = aux_outputs.pop()
+        out['pred_keypoints'] = final_kp_out['pred_keypoints']
 
-        # --- Keypoint heads ---
+        # Attach intermediate outputs for auxiliary losses (all except final)
+        if len(aux_outputs) > 0:
+            out['aux_outputs'] = [
+                {**out_i, 'pred_logits': out['pred_logits'],
+                 'pred_boxes': out['pred_boxes'], 'human_logits': out['human_logits']}
+                for out_i in aux_outputs
+            ]
+
+        return out
+
+    def _predict_keypoints(self, pose_x, bboxes):
+        """Predict keypoints as bbox-relative offsets, then convert to global coords."""
         B_kp, num_det, D = pose_x.shape
         kp_features = self.keypoint_proj(pose_x)  # [B, N, 17*D]
         kp_features = kp_features.reshape(B_kp, num_det, self.num_keypoints, D)
 
         kp_flat = kp_features.reshape(B_kp * num_det * self.num_keypoints, D)
-        keypoints_xy = self.simple_keypoint_xy_head(kp_flat).sigmoid()
+        keypoints_offset = self.simple_keypoint_xy_head(kp_flat).tanh()  # [-1, 1] relative offsets
         keypoints_vis = self.simple_keypoint_vis_head(kp_flat).sigmoid()
 
-        keypoints_xy = keypoints_xy.reshape(B_kp, num_det, self.num_keypoints, 2)
+        keypoints_offset = keypoints_offset.reshape(B_kp, num_det, self.num_keypoints, 2)
         keypoints_vis = keypoints_vis.reshape(B_kp, num_det, self.num_keypoints, 1)
-        pred_keypoints = torch.cat([keypoints_xy, keypoints_vis], dim=-1)
-        out['pred_keypoints'] = pred_keypoints
 
-        return out
+        # Convert relative offsets to global coordinates: kp = bbox_center + offset * bbox_size
+        bbox_center = bboxes[:, :, :2].unsqueeze(2)  # [B, N, 1, 2] (cx, cy)
+        bbox_size = bboxes[:, :, 2:].unsqueeze(2)    # [B, N, 1, 2] (w, h)
+        keypoints_xy = (bbox_center + keypoints_offset * bbox_size).clamp(0, 1)
+
+        pred_keypoints = torch.cat([keypoints_xy, keypoints_vis], dim=-1)
+        return {'pred_keypoints': pred_keypoints}
 
 
 # ============================================================================
 # Model constructors
 # ============================================================================
 
-def clip_joint_b16_pose_coco(
+def clip_joint_b16_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
@@ -426,7 +449,7 @@ def clip_joint_b16_pose_coco(
     return model.eval()
 
 
-def clip_joint_l14_pose_coco(
+def clip_joint_l14_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=20,
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
@@ -603,7 +626,7 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
         """Build vision encoder with ROI pose decoder."""
         encoder_name = self.vision_encoder_name
         if encoder_name == "vit_l14":
-            vision_encoder = clip_joint_l14_pose_coco(
+            vision_encoder = clip_joint_l14_simple_dec_roi(
                 pretrained=self.vision_encoder_pretrained,
                 input_resolution=self.inputs_image_res,
                 kernel_size=self.vision_encoder_kernel_size,
@@ -618,7 +641,7 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
                 roi_output_size=self.roi_output_size,
             )
         elif encoder_name == "vit_b16":
-            vision_encoder = clip_joint_b16_pose_coco(
+            vision_encoder = clip_joint_b16_simple_dec_roi(
                 pretrained=self.vision_encoder_pretrained,
                 input_resolution=self.inputs_image_res,
                 kernel_size=self.vision_encoder_kernel_size,

@@ -82,13 +82,13 @@ def parse_args():
                         help="Number of dataloader workers")
     parser.add_argument("-EPOCH", type=int, default=50,
                         help="Number of training epochs")
-    parser.add_argument("-LR", type=float, default=1e-4,
+    parser.add_argument("-LR", type=float, default=2e-4,
                         help="Learning rate")
-    parser.add_argument("-LR_BACKBONE", type=float, default=1e-5,
+    parser.add_argument("-LR_BACKBONE", type=float, default=2e-5,
                         help="Learning rate for backbone (lower than decoder)")
     parser.add_argument("-WEIGHT_DECAY", type=float, default=1e-4,
                         help="Weight decay")
-    parser.add_argument("-GRAD_CLIP", type=float, default=0.3,
+    parser.add_argument("-GRAD_CLIP", type=float, default=1.0,
                         help="Gradient clipping max norm (0 = disabled)")
 
     # Input size
@@ -325,6 +325,13 @@ def build_criterion(args, rank):
         'loss_human': args.W_HUMAN,
     }
 
+    # Add auxiliary loss weights for intermediate decoder layers
+    # Each intermediate layer gets the same weights (DETR convention)
+    num_aux_layers = max(0, args.POSE_LAYERS - 1)
+    for i in range(num_aux_layers):
+        for k, v in list(weight_dict.items()):
+            weight_dict[f'{k}_{i}'] = v
+
     # Heatmap model uses global heatmap loss instead of per-instance RLE loss
     if args.MODEL == 'sia_pose_heatmap':
         losses_list = ['keypoints_heatmap', 'boxes', 'human']
@@ -456,26 +463,29 @@ def build_optimizer(model, args):
     return optimizer
 
 
-def build_scheduler(optimizer, total_epochs, warmup_epochs=5):
-    """Build a learning rate scheduler with linear warmup + cosine annealing.
+def build_scheduler(optimizer, total_epochs, warmup_epochs=10, flat_epochs=15):
+    """Build a learning rate scheduler with linear warmup + flat hold + cosine annealing.
 
     Args:
         optimizer: torch optimizer
         total_epochs: total number of training epochs
-        warmup_epochs: number of epochs for linear warmup (default: 5)
+        warmup_epochs: number of epochs for linear warmup (default: 10)
+        flat_epochs: number of epochs to hold peak LR after warmup (default: 15)
 
     Returns:
-        scheduler object that implements warmup then cosine decay
+        scheduler object that implements warmup → flat → cosine decay
     """
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
-            # Linear warmup: 0.1x to 1.0x of base LR over warmup_epochs
-            return 0.1 + 0.9 * (epoch / warmup_epochs)
+            # Linear warmup: 0.01x to 1.0x of base LR over warmup_epochs
+            return 0.01 + 0.99 * (epoch / warmup_epochs)
+        elif epoch < warmup_epochs + flat_epochs:
+            # Hold at peak LR for flat_epochs
+            return 1.0
         else:
-            # Cosine annealing: 1.0x down to ~0 over remaining epochs
-            progress = (epoch - warmup_epochs) / (total_epochs - warmup_epochs)
-            # cos(pi * progress) goes from 1 to -1, so (1 + cos(...)) / 2 goes from 1 to 0
-            return max(1e-5, (1.0 + math.cos(math.pi * progress)) / 2)
+            # Cosine annealing: 1.0x down to 0.01x over remaining epochs
+            progress = (epoch - warmup_epochs - flat_epochs) / max(1, total_epochs - warmup_epochs - flat_epochs)
+            return max(0.01, 0.5 * (1.0 + math.cos(math.pi * progress)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -793,8 +803,8 @@ def main(args):
     # Build optimizer
     optimizer = build_optimizer(model, args)
 
-    # Build scheduler with linear warmup (5 epochs) + cosine annealing
-    scheduler = build_scheduler(optimizer, total_epochs=args.EPOCH, warmup_epochs=5)
+    # Build scheduler with linear warmup (10 epochs) + flat hold (15 epochs) + cosine annealing
+    scheduler = build_scheduler(optimizer, total_epochs=args.EPOCH, warmup_epochs=10, flat_epochs=15)
 
     # Build datasets
     if is_main_process():
