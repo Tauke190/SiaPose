@@ -48,8 +48,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SIA for Pose Estimation on COCO")
 
     # Model
-    parser.add_argument("-MODEL", type=str, default='pose', choices=['sia_pose', 'sia_pose_simple', 'sia_pose_simple_dec', 'sia_pose_simple_dec_roi', 'sia_pose_heatmap', 'sia_pose_dino', 'sia_pose_dino_simple'],
-                        help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_simple_dec' (lightweight decoder), 'sia_pose_simple_dec_roi' (ROI decoder), 'sia_pose_dino' (DINOv2 + LED), 'sia_pose_dino_simple' (DINOv2 encoder-only)")
+    parser.add_argument("-MODEL", type=str, default='pose', choices=['sia_pose', 'sia_pose_simple', 'sia_pose_simple_dec', 'sia_pose_simple_dec_roi', 'sia_pose_heatmap', 'sia_pose_dino', 'sia_pose_dino_simple', 'sia_pose_coco', 'sia_pose_posetrack'],
+                        help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_simple_dec' (lightweight decoder), 'sia_pose_simple_dec_roi' (ROI decoder), 'sia_pose_coco' (COCO ROI decoder), 'sia_pose_posetrack' (PoseTrack ROI decoder), 'sia_pose_dino' (DINOv2 + LED), 'sia_pose_dino_simple' (DINOv2 encoder-only)")
     parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14', 'dino_b14', 'dino_l14'],
                         help="Model size: b16/l14 (ViCLIP), dino_b14/dino_l14 (DINOv2)")
     parser.add_argument("-FRAMES", type=int, default=1,
