@@ -10,13 +10,19 @@ mkdir -p training_logs
 # Generate log filename with timestamp
 LOG_FILE="training_logs/train_$(date +%Y%m%d_%H%M%S).log"
 
-MODEL=sia_pose_coco  # [sia_pose_simple, sia_pose_simple_dec , sia_pose_coco, sia_pose_posetrack]
 
-CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 train_pose.py \
+
+#/mnt/SSD2/coco2017/images
+#/mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json
+#/mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json
+
+MODEL=sia_pose_coco  # [sia_pose_simple, sia_pose_simple_dec , sia_pose_coco, sia_pose_posetrack]
+# CUDA_VISIBLE_DEVICES=0 
+torchrun --nproc_per_node=1 train_pose.py \
        -MODEL $MODEL -SIZE b16 \
-       -ROOT /mnt/SSD2/coco2017/images \
-       -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
-       -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
+       -ROOT /home/c3-0/datasets/coco \
+       -TRAIN_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_train2017.json \
+       -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
        -BS 32 -EPOCH 300 -LR 5e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 100 -LOG 100 -WORKERS 12 -LR_BACKBONE 1e-5 -DET 20 \
        -HEIGHT 480 -WIDTH 640 \
        --RESUME weights/avak_b16_11.pt \
