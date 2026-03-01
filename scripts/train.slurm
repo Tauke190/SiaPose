@@ -49,4 +49,4 @@ torchrun --nproc_per_node=2 train_pose.py \
        -BS 32 -EPOCH 100 -LR 5e-4 --SAVE -FRAMES 1 \
        -WORKERS 12 -EXP sia_pose -DET 20 -HEIGHT 480 -WIDTH 640 -LOG 100 -POSE_LAYERS 3 -ROI_SIZE 14 \
        --RESUME weights/avak_b16_11.pt \
-       --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN sia_decoder_dec_roialign_20
+       --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN sia_decoder_dec_roialign_20_tuned

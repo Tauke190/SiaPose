@@ -10,6 +10,7 @@ mkdir -p training_logs
 # Generate log filename with timestamp
 LOG_FILE="training_logs/train_$(date +%Y%m%d_%H%M%S).log"
 
+export PYTHONIOENCODING=utf-8
 
 
 #/mnt/SSD2/coco2017/images
