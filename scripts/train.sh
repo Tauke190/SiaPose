@@ -14,7 +14,7 @@ MODEL=sia_pose_coco  # [sia_pose_simple, sia_pose_simple_dec , sia_pose_coco, si
 
 CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 train_pose.py \
        -MODEL $MODEL -SIZE b16 \
-       -COCO_ROOT /mnt/SSD2/coco2017/images \
+       -ROOT /mnt/SSD2/coco2017/images \
        -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
        -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
        -BS 32 -EPOCH 300 -LR 5e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 100 -LOG 100 -WORKERS 12 -LR_BACKBONE 1e-5 -DET 20 \
