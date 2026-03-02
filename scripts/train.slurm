@@ -15,6 +15,8 @@ while ss -tuln | grep -q ":$PORT"; do
 done
 echo "Free port found: $PORT"
 
+export PYTHONIOENCODING=utf-8
+
 # Load necessary modules
 module load anaconda3
 module load cuda
