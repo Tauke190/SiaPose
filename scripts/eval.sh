@@ -7,20 +7,20 @@
 # Override defaults with environment variables:
 #   CHECKPOINT=weights/my_model.pt MODEL=sia_pose bash scripts/eval.sh
 
-CHECKPOINT=${CHECKPOINT:-"weights/sia_pose_simple_b16_best.pt"}
-MODEL=${MODEL:-"sia_pose_simple"}
+CHECKPOINT=${CHECKPOINT:-"weights/sia_ROIAlign_1.pt"}
+MODEL=${MODEL:-"sia_pose_coco"}
 SIZE=${SIZE:-"b16"}
 DATASET=${DATASET:-"coco"}
 BATCH_SIZE=${BATCH_SIZE:-8}
 WORKERS=${WORKERS:-4}
 DET_TOKENS=${DET_TOKENS:-20}
-NUM_FRAMES=${NUM_FRAMES:-9}
+NUM_FRAMES=${NUM_FRAMES:-1}
 POSE_LAYERS=${POSE_LAYERS:-3}
 
 if [ "$DATASET" = "coco" ]; then
     DATA_ROOT=${COCO_ROOT:-"/mnt/SSD2/coco2017/images"}
     ANN_FILE=${COCO_ANN_FILE:-"/mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json"}
-    OUTPUT_DIR=${OUTPUT_DIR:-"output/eval_results_coco"}
+    OUTPUT_DIR=${OUTPUT_DIR:-"output/eval_results_coco_roi_align"}
 elif [ "$DATASET" = "posetrack" ]; then
     DATA_ROOT=${POSETRACK_ROOT:-"/mnt/SSD2/posetrack/posetrack_2017"}
     ANN_FILE=${POSETRACK_ANN_FILE:-"/mnt/SSD2/posetrack/posetrack_2017/jsons/posetrack_val_15kpts.json"}
@@ -28,6 +28,7 @@ elif [ "$DATASET" = "posetrack" ]; then
 else
     echo "Unknown dataset: $DATASET"
     exit 1
+fi 
 
 
 python val_pose.py \

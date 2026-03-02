@@ -67,13 +67,13 @@ def get_sia_pose_simple_dec(size='l',
 
 
 def get_sia_pose_coco(size='l',
-                                pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
-                                det_token_num=100,
-                                num_frames=9,
-                                num_keypoints=17,
-                                decoder_layers=3,
-                                max_roi_cap=0,
-                                roi_output_size=14):
+                        pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
+                        det_token_num=100,
+                        num_frames=1,
+                        num_keypoints=17,
+                        decoder_layers=3,
+                        max_roi_cap=0,
+                        roi_output_size=14):
     """
     Get SIA pose model with ROI-based pose decoder.
 

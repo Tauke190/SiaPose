@@ -390,7 +390,7 @@ def parse_args():
     p.add_argument('--checkpoint', type=str, required=True,
                    help='Path to model checkpoint (.pt)')
     p.add_argument('--model', type=str, default='sia_pose_simple',
-                   choices=['sia_pose_simple', 'sia_pose_simple_dec', 'sia_pose_simple_dec_roi'],
+                   choices=['sia_pose_coco', 'sia_pose_simple_dec', 'sia_pose_simple_dec_roi'],
                    help='Model architecture')
     p.add_argument('--size', type=str, default='b16', choices=['b16', 'l14'],
                    help='Model size')

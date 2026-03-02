@@ -179,8 +179,12 @@ def get_dataset(args, transforms):
         # Try instances annotation (detection), fall back to keypoints annotation
         ann_file = os.path.join(args.data_root, 'annotations', 'instances_val2017.json')
         if not os.path.exists(ann_file):
+            # Try parent directory (in case data_root is the images subdirectory)
+            parent_dir = os.path.dirname(args.data_root)
+            ann_file = os.path.join(parent_dir, 'annotations', 'instances_val2017.json')
+        if not os.path.exists(ann_file):
             print(f"Warning: {ann_file} not found, trying person_keypoints_val2017.json")
-            ann_file = os.path.join(args.data_root, 'annotations', 'person_keypoints_val2017.json')
+            ann_file = os.path.join(os.path.dirname(args.data_root), 'annotations', 'person_keypoints_val2017.json')
 
     img_dir = args.img_dir
     if img_dir is None:
@@ -274,6 +278,10 @@ def evaluate_detection(model, dataloader, args):
             pred_boxes = outputs['pred_boxes'][batch_idx].cpu().numpy().astype(float)
             human_scores = outputs['human_logits'][batch_idx].cpu().numpy().astype(float)
 
+            # Ensure scores are 1D
+            if human_scores.ndim > 1:
+                human_scores = human_scores.squeeze()
+            
             # Filter detections by score threshold
             valid_idx = human_scores > args.conf_thresh
             pred_boxes = pred_boxes[valid_idx]
