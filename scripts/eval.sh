@@ -7,12 +7,12 @@
 # Override defaults with environment variables:
 #   CHECKPOINT=weights/my_model.pt MODEL=sia_pose bash scripts/eval.sh
 
-CHECKPOINT=${CHECKPOINT:-"output/sia_pose_simple_b16_best.pt"}
+CHECKPOINT=${CHECKPOINT:-"weights/sia_pose_simple_b16_best.pt"}
 MODEL=${MODEL:-"sia_pose_simple"}
 SIZE=${SIZE:-"b16"}
 DATASET=${DATASET:-"coco"}
-BATCH_SIZE=${BATCH_SIZE:-16}
-WORKERS=${WORKERS:-8}
+BATCH_SIZE=${BATCH_SIZE:-8}
+WORKERS=${WORKERS:-4}
 DET_TOKENS=${DET_TOKENS:-20}
 NUM_FRAMES=${NUM_FRAMES:-9}
 POSE_LAYERS=${POSE_LAYERS:-3}
@@ -28,7 +28,7 @@ elif [ "$DATASET" = "posetrack" ]; then
 else
     echo "Unknown dataset: $DATASET"
     exit 1
-fi
+
 
 python val_pose.py \
     --checkpoint "$CHECKPOINT" \

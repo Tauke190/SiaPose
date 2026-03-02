@@ -29,7 +29,7 @@ from torchvision.transforms import v2
 from tqdm import tqdm
 
 from sia import (
-    get_sia_pose_simple, get_sia_pose_simple_dec, get_sia_pose_simple_dec_roi,
+    get_sia_pose_simple, get_sia_pose_simple_dec,get_sia_pose_coco,
     PostProcessPose, COCO_KEYPOINT_NAMES,
 )
 from datasets import COCOPoseVal, PoseTrackPoseVal
@@ -207,8 +207,8 @@ def build_model(args):
             num_keypoints=17,
             decoder_layers=args.pose_layers,
         )['sia']
-    elif args.model == 'sia_pose_simple_dec_roi':
-        model = get_sia_pose_simple_dec_roi(
+    elif args.model == 'sia_pose_coco':
+        model = get_sia_pose_coco(
             size=size, pretrain=None,
             det_token_num=args.det_tokens,
             num_frames=args.num_frames,

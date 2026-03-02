@@ -2,6 +2,7 @@ from .simple_tokenizer import SimpleTokenizer as _Tokenizer
 from .sia_pose_simple import SIA_POSE_SIMPLE, SIA_POSE_SIMPLE_DEC
 from .sia_pose_coco import SIA_POSE_SIMPLE_DEC_ROI
 from .sia_pose_heatmap import SIA_POSE_HEATMAP
+from .sia_detection_model import SIA_DETECTION_MODEL
 
 from .sia_pose_dino_simple import SIA_POSE_DINO_SIMPLE
 from torch import nn

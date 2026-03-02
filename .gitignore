@@ -27,6 +27,7 @@ weights/
 extras/
 wandb/
 output/
+datasets/
 
 # Virtual environments
 .venv/
