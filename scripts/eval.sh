@@ -7,12 +7,12 @@
 # Override defaults with environment variables:
 #   CHECKPOINT=weights/my_model.pt MODEL=sia_pose bash scripts/eval.sh
 
-CHECKPOINT=${CHECKPOINT:-"weights/sia_ROIAlign_1.pt"}
+CHECKPOINT=${CHECKPOINT:-"weights/sia_pose_coco_b16_best.pt"}
 MODEL=${MODEL:-"sia_pose_coco"}
 SIZE=${SIZE:-"b16"}
 DATASET=${DATASET:-"coco"}
-BATCH_SIZE=${BATCH_SIZE:-8}
-WORKERS=${WORKERS:-4}
+BATCH_SIZE=${BATCH_SIZE:-32}
+WORKERS=${WORKERS:-8}
 DET_TOKENS=${DET_TOKENS:-20}
 NUM_FRAMES=${NUM_FRAMES:-1}
 POSE_LAYERS=${POSE_LAYERS:-3}
@@ -20,7 +20,7 @@ POSE_LAYERS=${POSE_LAYERS:-3}
 if [ "$DATASET" = "coco" ]; then
     DATA_ROOT=${COCO_ROOT:-"/mnt/SSD2/coco2017/images"}
     ANN_FILE=${COCO_ANN_FILE:-"/mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json"}
-    OUTPUT_DIR=${OUTPUT_DIR:-"output/eval_results_coco_roi_align"}
+    OUTPUT_DIR=${OUTPUT_DIR:-"output/lado"}
 elif [ "$DATASET" = "posetrack" ]; then
     DATA_ROOT=${POSETRACK_ROOT:-"/mnt/SSD2/posetrack/posetrack_2017"}
     ANN_FILE=${POSETRACK_ANN_FILE:-"/mnt/SSD2/posetrack/posetrack_2017/jsons/posetrack_val_15kpts.json"}

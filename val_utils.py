@@ -8,8 +8,11 @@ Provides a single source of truth for validation logic used by both:
 This ensures consistency in metrics computation and COCO evaluation.
 """
 import json
+import time
+import sys
 import numpy as np
 import torch
+from tqdm import tqdm
 from pycocotools.coco import COCO
 from pycocotools.cocoeval import COCOeval
 
@@ -110,7 +113,8 @@ def run_coco_eval(ann_file, coco_results, sigmas=None):
 
 @torch.no_grad()
 def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
-                  sigmas=None, criterion=None, outputs=None, targets=None):
+                  sigmas=None, criterion=None, outputs=None, targets=None,
+                  human_conf=0.5, keypoint_conf=0.3, kp_map_fn=None):
     """
     Run validation on a batch of data.
 
@@ -126,6 +130,9 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
         criterion: optional loss criterion for computing validation loss
         outputs: optional pre-computed model outputs (for reusing training outputs)
         targets: optional pre-computed targets (for reusing training targets)
+        human_conf: human detection confidence threshold (default 0.5)
+        keypoint_conf: keypoint visibility confidence threshold (default 0.3)
+        kp_map_fn: optional callable to map keypoints (e.g., 17→15 for PoseTrack)
 
     Returns:
         dict with keys:
@@ -135,6 +142,7 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
           - 'total_det': total detected persons
           - 'mean_oks': mean OKS over all matched pairs
           - 'val_loss': validation loss (if criterion provided)
+          - 'inference_time': total inference time in seconds
     """
     if sigmas is None:
         sigmas = COCO_SIGMAS
@@ -148,15 +156,25 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
     num_images = 0
     total_oks = 0.0
     num_oks_matched = 0
+    total_inference_time = 0.0
 
-    for samples, targets_batch in dataloader:
+    for samples, targets_batch in tqdm(dataloader, desc="Evaluating", file=sys.stderr):
         # Move samples to device
         device = next(model.parameters()).device
         samples = samples.to(device)
 
+        t0 = time.time()
         with torch.no_grad():
             outputs_batch = model(samples)
-            results = postprocess(outputs_batch, imgsize, human_conf=0.5, keypoint_conf=0.3)
+            results = postprocess(outputs_batch, imgsize, human_conf=human_conf, keypoint_conf=keypoint_conf)
+        total_inference_time += time.time() - t0
+
+        # Apply keypoint mapping if needed (e.g., PoseTrack 17→15 kpts)
+        if kp_map_fn is not None:
+            for result in results:
+                if len(result['keypoints']) > 0:
+                    result['keypoints'] = kp_map_fn(result['keypoints'].cpu().numpy())
+                    result['keypoints'] = torch.from_numpy(result['keypoints'])
 
         # Process each sample in the batch
         for result, target in zip(results, targets_batch):
@@ -196,12 +214,13 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
                     ],
                 })
 
-            # Compute per-instance OKS with greedy IoU matching
+            # Compute per-instance OKS with greedy OKS-based matching
+            # (matches predictions to GT based on pose similarity, not box overlap)
             gt_boxes_norm = target['boxes'].cpu().numpy().astype(float)
             gt_kps_norm = target['keypoints'].cpu().numpy().astype(float)
 
             if len(pred_boxes) > 0 and len(gt_boxes_norm) > 0:
-                # Convert GT boxes: normalized cxcywh -> pixel xyxy
+                # Convert GT boxes: normalized cxcywh -> pixel xyxy (for area computation)
                 gt_boxes_pixel = np.zeros_like(gt_boxes_norm)
                 gt_boxes_pixel[:, 0] = (gt_boxes_norm[:, 0] - gt_boxes_norm[:, 2] / 2) * orig_w
                 gt_boxes_pixel[:, 1] = (gt_boxes_norm[:, 1] - gt_boxes_norm[:, 3] / 2) * orig_h
@@ -213,30 +232,33 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
                 gt_kps_pixel[:, :, 0] *= orig_w
                 gt_kps_pixel[:, :, 1] *= orig_h
 
-                # GT bbox areas (w * h in pixels)
+                # GT bbox areas (w * h in pixels) - needed for OKS normalization
                 gt_areas = (gt_boxes_pixel[:, 2] - gt_boxes_pixel[:, 0]) * \
                            (gt_boxes_pixel[:, 3] - gt_boxes_pixel[:, 1])
 
-                # Pred boxes in pixel xyxy
-                pred_boxes_pixel = np.zeros((len(pred_boxes), 4))
-                pred_boxes_pixel[:, 0] = pred_boxes[:, 0] * scale_x
-                pred_boxes_pixel[:, 1] = pred_boxes[:, 1] * scale_y
-                pred_boxes_pixel[:, 2] = pred_boxes[:, 2] * scale_x
-                pred_boxes_pixel[:, 3] = pred_boxes[:, 3] * scale_y
+                # Convert pred keypoints to pixel coords
+                pred_kps_pixel = np.zeros((len(pred_kps), num_keypoints, 2))
+                pred_kps_pixel[:, :, 0] = pred_kps[:, :, 0] * scale_x
+                pred_kps_pixel[:, :, 1] = pred_kps[:, :, 1] * scale_y
 
-                # Greedy matching: preds sorted by score (already sorted from postprocess)
+                # Compute OKS matrix: [num_preds, num_gts]
+                num_preds = len(pred_kps_pixel)
+                num_gts = len(gt_kps_pixel)
+                oks_matrix = np.zeros((num_preds, num_gts))
+                for pi in range(num_preds):
+                    for gi in range(num_gts):
+                        oks_matrix[pi, gi] = compute_oks(
+                            pred_kps_pixel[pi], gt_kps_pixel[gi], gt_areas[gi], sigmas
+                        )
+
+                # Greedy matching by OKS: preds sorted by score (already sorted from postprocess)
                 matched_gt = set()
-                for pi in range(len(pred_boxes_pixel)):
-                    ious = box_iou_np(pred_boxes_pixel[pi], gt_boxes_pixel)
-                    order = np.argsort(-ious)
+                for pi in range(num_preds):
+                    oks_scores = oks_matrix[pi]
+                    order = np.argsort(-oks_scores)
                     for gi in order:
-                        if gi not in matched_gt and ious[gi] > 0.0:
-                            pred_xy = np.stack([
-                                pred_kps[pi, :, 0] * scale_x,
-                                pred_kps[pi, :, 1] * scale_y,
-                            ], axis=1)
-                            oks = compute_oks(pred_xy, gt_kps_pixel[gi], gt_areas[gi], sigmas)
-                            total_oks += oks
+                        if gi not in matched_gt and oks_scores[gi] > 0.0:
+                            total_oks += oks_scores[gi]
                             num_oks_matched += 1
                             matched_gt.add(gi)
                             break
@@ -267,4 +289,7 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
         'mean_oks': mean_oks,
         'val_loss': val_loss,
         'num_oks_matched': num_oks_matched,
+        'total_oks': total_oks,  # For distributed aggregation
+        'num_val_batches': num_val_batches,  # For distributed aggregation
+        'inference_time': total_inference_time,  # Total inference time in seconds
     }

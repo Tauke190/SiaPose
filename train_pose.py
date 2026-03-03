@@ -115,9 +115,7 @@ def parse_args():
     parser.add_argument("-EXP", type=str, default='pose_coco',
                         help="Experiment name for saving")
     parser.add_argument("--SAVE", action='store_true',
-                        help="Save model checkpoints")
-    parser.add_argument("-SAVE_FREQ", type=int, default=5,
-                        help="Save checkpoint every N epochs")
+                        help="Save best model checkpoint")
     parser.add_argument("--RESUME", type=str, default=None,
                         help="Path to checkpoint to resume from")
 
@@ -206,39 +204,6 @@ def collate_fn(batch):
 
 def build_model(args, rank):
     """Build SIA model with pose detection."""
-    # DINOv2 models don't need ViCLIP pretrain weights
-    if args.MODEL == 'sia_pose_dino':
-        if args.SIZE == 'dino_b14':
-            dino_size = 'b'
-        elif args.SIZE == 'dino_l14':
-            dino_size = 'l'
-        else:
-            raise ValueError(f"Invalid SIZE '{args.SIZE}' for sia_pose_dino. Use 'dino_b14' or 'dino_l14'.")
-        model = get_sia_pose_dino(
-            size=dino_size,
-            det_token_num=args.DET,
-            num_frames=args.FRAMES,
-            num_keypoints=17,
-            decoder_layers=args.POSE_LAYERS,
-        )['sia']
-        return model
-
-    if args.MODEL == 'sia_pose_dino_simple':
-        if args.SIZE == 'dino_b14':
-            dino_size = 'b'
-        elif args.SIZE == 'dino_l14':
-            dino_size = 'l'
-        else:
-            raise ValueError(f"Invalid SIZE '{args.SIZE}' for sia_pose_dino_simple. Use 'dino_b14' or 'dino_l14'.")
-        model = get_sia_pose_dino_simple(
-            size=dino_size,
-            det_token_num=args.DET,
-            num_frames=args.FRAMES,
-            num_keypoints=17,
-        )['sia']
-        return model
-
-    # ViCLIP-based models
     if args.SIZE == 'b16':
         pretrain = "weights/ViCLIP-B_InternVid-FLT-10M.pth"
         size = 'b'
@@ -557,16 +522,6 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                 if k in weight_dict:
                     loss_str += f" | {k}: {v.item():.3f}"
 
-            # Add ROI statistics to loss string if available (handle DDP wrapping)
-            try:
-                model_obj = model.module if hasattr(model, 'module') else model
-                if hasattr(model_obj, '_last_roi_stats') and model_obj._last_roi_stats:
-                    roi_stats = model_obj._last_roi_stats
-                    if 'roi_mean' in roi_stats and 'roi_std' in roi_stats and 'padding_waste_pct' in roi_stats:
-                        loss_str += f" | roi: μ={roi_stats['roi_mean']:.1f} σ={roi_stats['roi_std']:.1f} waste={roi_stats['padding_waste_pct']:.1f}%"
-            except Exception:
-                pass  # Skip ROI stats if any error occurs
-
             # tqdm updates automatically with postfix set below
 
             # Log to wandb periodically
@@ -582,47 +537,15 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                     if k in weight_dict:
                         wandb_metrics[f'train/{k}'] = v.item()
 
-                # Log ROI statistics if available (for ROI-based models, handle DDP wrapping)
-                try:
-                    model_obj = model.module if hasattr(model, 'module') else model
-                    if hasattr(model_obj, '_last_roi_stats') and model_obj._last_roi_stats:
-                        roi_stats = model_obj._last_roi_stats
-                        wandb_metrics.update({
-                            'roi/count': roi_stats.get('roi_count', 0),
-                            'roi/mean': roi_stats.get('roi_mean', 0),
-                            'roi/std': roi_stats.get('roi_std', 0),
-                            'roi/min': roi_stats.get('roi_min', 0),
-                            'roi/max': roi_stats.get('roi_max', 0),
-                            'roi/median': roi_stats.get('roi_median', 0),
-                            'roi/max_len': roi_stats.get('max_roi_len', 0),
-                            'roi/cap': roi_stats.get('max_roi_cap', 0),
-                            'roi/capped_count': roi_stats.get('capped_count', 0),
-                            'roi/padding_waste_pct': roi_stats.get('padding_waste_pct', 0),
-                            'roi/valid_patches': roi_stats.get('valid_patches', 0),
-                            'roi/total_slots': roi_stats.get('total_slots', 0),
-                        })
-                except Exception:
-                    pass  # Skip ROI stats logging if any error occurs
-
                 wandb.log(wandb_metrics, step=global_step)
 
-            # Log detailed losses and ROI stats to console every LOG steps
+            # Log detailed losses to console every LOG steps
             if (batch_idx + 1) % log_freq == 0 or batch_idx == 0:
                 log_msg = f"Epoch {epoch} [{batch_idx + 1}/{num_total_batches}] "
                 log_msg += f"loss: {loss_value:.4f} | grad_norm: {grad_norm:.4f}"
                 for k, v in loss_dict.items():
                     if k in weight_dict:
                         log_msg += f" | {k}: {v.item():.4f}"
-
-                # Add ROI statistics if available
-                try:
-                    model_obj = model.module if hasattr(model, 'module') else model
-                    if hasattr(model_obj, '_last_roi_stats') and model_obj._last_roi_stats:
-                        roi_stats = model_obj._last_roi_stats
-                        if 'roi_mean' in roi_stats:
-                            log_msg += f" | ROI: μ={roi_stats.get('roi_mean', 0):.1f} σ={roi_stats.get('roi_std', 0):.1f} min={roi_stats.get('roi_min', 0)} max={roi_stats.get('roi_max', 0)} waste={roi_stats.get('padding_waste_pct', 0):.1f}%"
-                except Exception:
-                    pass
 
                 if rank == 0:
                     print(log_msg, flush=True)
@@ -667,18 +590,20 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
     """Validate the model using official COCO evaluation (pycocotools) or PoseTrack OKS.
 
     Wraps val_utils.validate_pose with DDP-aware dataset-specific evaluation.
+    Aggregates results from all GPUs when running in distributed mode.
     """
     from val_utils import validate_pose
 
     model.eval()
     imgsize = (args.HEIGHT, args.WIDTH)
+    world_size = get_world_size()
 
     # Select keypoints and sigmas based on model type
     is_posetrack = args.MODEL == 'sia_pose_posetrack'
     num_keypoints = 15 if is_posetrack else 17
     sigmas = POSETRACK_SIGMAS if is_posetrack else COCO_SIGMAS
 
-    # Call the shared validation logic
+    # Call the shared validation logic (each GPU processes its subset)
     val_results = validate_pose(
         model=model,
         dataloader=dataloader,
@@ -693,9 +618,48 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
     num_images = val_results['num_images']
     total_gt = val_results['total_gt']
     total_det = val_results['total_det']
-    mean_oks = val_results['mean_oks']
-    val_loss = val_results['val_loss']
+    total_oks = val_results.get('total_oks', val_results['mean_oks'] * val_results['num_oks_matched'])
+    val_loss_sum = val_results['val_loss'] * val_results.get('num_val_batches', max(num_images // args.BS, 1))
     num_oks_matched = val_results['num_oks_matched']
+    num_val_batches = val_results.get('num_val_batches', max(num_images // args.BS, 1))
+
+    # Aggregate stats across all GPUs in distributed mode
+    if world_size > 1 and dist.is_initialized():
+        device = torch.device(f'cuda:{rank}')
+        
+        # Aggregate scalar stats using all_reduce (sum)
+        stats_tensor = torch.tensor([
+            float(num_images),
+            float(total_gt),
+            float(total_det),
+            float(total_oks),
+            float(num_oks_matched),
+            float(val_loss_sum),
+            float(num_val_batches),
+        ], device=device)
+        
+        dist.all_reduce(stats_tensor, op=dist.ReduceOp.SUM)
+        
+        num_images = int(stats_tensor[0].item())
+        total_gt = int(stats_tensor[1].item())
+        total_det = int(stats_tensor[2].item())
+        total_oks = stats_tensor[3].item()
+        num_oks_matched = int(stats_tensor[4].item())
+        val_loss_sum = stats_tensor[5].item()
+        num_val_batches = int(stats_tensor[6].item())
+        
+        # Gather coco_results from all GPUs for COCO evaluation
+        gathered_results = [None] * world_size
+        dist.all_gather_object(gathered_results, coco_results)
+        
+        # Flatten gathered results (only needed on rank 0 for COCO eval)
+        coco_results = []
+        for results_from_gpu in gathered_results:
+            coco_results.extend(results_from_gpu)
+
+    # Compute aggregated metrics
+    mean_oks = total_oks / max(num_oks_matched, 1)
+    val_loss = val_loss_sum / max(num_val_batches, 1)
 
     # Run official COCO evaluation (only on rank 0, and only for COCO dataset)
     coco_stats = {}
@@ -962,35 +926,23 @@ def main(args):
                         epoch_metrics[f'epoch/{k}'] = val_stats[k]
             wandb.log(epoch_metrics)
 
-        # Save checkpoint
-        if args.SAVE and is_main_process():
+        # Save best checkpoint based on AP score (only during validation)
+        if args.SAVE and is_main_process() and val_stats is not None and 'AP' in val_stats:
             # Get state dict (handle DDP vs non-DDP model)
             state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-            if (epoch + 1) % args.SAVE_FREQ == 0:
-                ckpt_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_epoch{epoch}.pt')
-                torch.save(state_dict, ckpt_path)
-                print(f"Saved checkpoint: {ckpt_path}", flush=True)
+            current_ap = val_stats['AP']
+            if current_ap > best_ap:
+                best_ap = current_ap
+                best_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_best.pt')
+                torch.save(state_dict, best_path)
+                print(f"Saved best model (AP: {best_ap:.4f}): {best_path}", flush=True)
 
-            # Save best based on AP score (only during validation)
-            if val_stats is not None and 'AP' in val_stats:
-                current_ap = val_stats['AP']
-                if current_ap > best_ap:
-                    best_ap = current_ap
-                    best_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_best.pt')
-                    torch.save(state_dict, best_path)
-                    print(f"Saved best model (AP: {best_ap:.4f}): {best_path}", flush=True)
-
-    # Save final
+    # Save training stats only (best model already saved during training)
     if args.SAVE and is_main_process():
-        state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-        final_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_final.pt')
-        torch.save(state_dict, final_path)
-        print(f"Saved final model: {final_path}", flush=True)
-
-        # Save training stats
         stats_path = os.path.join(exp_dir, 'train_stats.json')
         with open(stats_path, 'w') as f:
             json.dump(train_stats, f, indent=2)
+        print(f"Saved training stats: {stats_path}", flush=True)
 
     # Finish wandb run
     if use_wandb:

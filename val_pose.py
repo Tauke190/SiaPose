@@ -33,7 +33,7 @@ from sia import (
     PostProcessPose, COCO_KEYPOINT_NAMES,
 )
 from datasets import COCOPoseVal, PoseTrackPoseVal
-from val_utils import COCO_SIGMAS, compute_oks, box_iou_np, run_coco_eval, validate_pose
+from val_utils import COCO_SIGMAS, validate_pose, run_coco_eval
 
 # PoseTrack 2017 keypoint names (15 keypoints)
 POSETRACK_KEYPOINT_NAMES = [
@@ -233,10 +233,10 @@ def collate_fn(batch):
 @torch.no_grad()
 def evaluate(model, dataloader, postprocess, args, num_keypoints,
              sigmas, kp_map_fn=None):
-    """Run inference and collect predictions in COCO result format.
+    """Run inference using the shared validate_pose function.
 
-    Wraps val_utils.validate_pose to add dataset-specific keypoint mapping
-    and inference time tracking.
+    Wraps val_utils.validate_pose to use configurable thresholds from args
+    and support dataset-specific keypoint mapping.
 
     Args:
         sigmas: np.array of per-keypoint OKS sigmas
@@ -251,129 +251,26 @@ def evaluate(model, dataloader, postprocess, args, num_keypoints,
         mean_oks: mean OKS over all matched pred-GT pairs
     """
     imgsize = (args.height, args.width)
-    device = next(model.parameters()).device
 
-    # Create a wrapper dataloader that tracks inference time
-    class TimedDataLoader:
-        def __init__(self, loader):
-            self.loader = loader
-            self.total_inference_time = 0.0
+    # Call the shared validation logic
+    val_results = validate_pose(
+        model=model,
+        dataloader=dataloader,
+        postprocess=postprocess,
+        imgsize=imgsize,
+        num_keypoints=num_keypoints,
+        sigmas=sigmas,
+        human_conf=args.conf_thresh,
+        keypoint_conf=args.kp_conf_thresh,
+        kp_map_fn=kp_map_fn,
+    )
 
-        def __iter__(self):
-            model_eval_time = 0.0
-            for samples, targets in self.loader:
-                samples = samples.to(device)
+    coco_results = val_results['coco_results']
+    num_images = val_results['num_images']
+    mean_oks = val_results['mean_oks']
+    inference_time = val_results['inference_time']
 
-                t0 = time.time()
-                with torch.no_grad():
-                    outputs = model(samples)
-                    results = postprocess(outputs, imgsize,
-                                        human_conf=args.conf_thresh,
-                                        keypoint_conf=args.kp_conf_thresh)
-                model_eval_time += time.time() - t0
-
-                # Apply keypoint mapping if needed
-                if kp_map_fn is not None:
-                    for result in results:
-                        if len(result['keypoints']) > 0:
-                            result['keypoints'] = kp_map_fn(result['keypoints'].cpu().numpy())
-                            result['keypoints'] = torch.from_numpy(result['keypoints'])
-
-                yield samples, targets, results
-
-            self.total_inference_time = model_eval_time
-
-    # Use shared validation logic
-    timed_loader = TimedDataLoader(dataloader)
-
-    coco_results = []
-    num_images = 0
-    total_oks = 0.0
-    num_oks_matched = 0
-
-    for _, targets, results in tqdm(timed_loader, desc="Evaluating", file=sys.stderr):
-        for result, target in zip(results, targets):
-            image_id = int(target['image_id'])
-            num_images += 1
-
-            pred_boxes = result['boxes'].cpu().numpy().astype(float)
-            pred_kps = result['keypoints'].cpu().numpy().astype(float) if isinstance(result['keypoints'], torch.Tensor) else result['keypoints'].astype(float)
-            pred_scores = result['scores'].cpu().numpy().astype(float)
-
-            # Rescale from resized coords to original image coords
-            orig_h, orig_w = target['orig_size'].tolist()
-            scale_x = orig_w / imgsize[1]
-            scale_y = orig_h / imgsize[0]
-
-            for pi in range(len(pred_boxes)):
-                box = pred_boxes[pi]
-                kps = pred_kps[pi]
-                kps_flat = []
-                for ki in range(num_keypoints):
-                    kps_flat.extend([
-                        float(kps[ki, 0]) * scale_x,
-                        float(kps[ki, 1]) * scale_y,
-                        2 if float(kps[ki, 2]) > args.kp_conf_thresh else 1,
-                    ])
-                coco_results.append({
-                    'image_id': image_id,
-                    'category_id': 1,
-                    'keypoints': kps_flat,
-                    'score': float(pred_scores[pi]),
-                    'bbox': [
-                        float(box[0]) * scale_x, float(box[1]) * scale_y,
-                        float(box[2] - box[0]) * scale_x, float(box[3] - box[1]) * scale_y,
-                    ],
-                })
-
-            # Compute per-instance OKS with greedy IoU matching
-            gt_boxes_norm = target['boxes'].cpu().numpy().astype(float)
-            gt_kps_norm = target['keypoints'].cpu().numpy().astype(float)
-
-            if len(pred_boxes) > 0 and len(gt_boxes_norm) > 0:
-                # Convert GT boxes: normalized cxcywh -> pixel xyxy
-                gt_boxes_pixel = np.zeros_like(gt_boxes_norm)
-                gt_boxes_pixel[:, 0] = (gt_boxes_norm[:, 0] - gt_boxes_norm[:, 2] / 2) * orig_w
-                gt_boxes_pixel[:, 1] = (gt_boxes_norm[:, 1] - gt_boxes_norm[:, 3] / 2) * orig_h
-                gt_boxes_pixel[:, 2] = (gt_boxes_norm[:, 0] + gt_boxes_norm[:, 2] / 2) * orig_w
-                gt_boxes_pixel[:, 3] = (gt_boxes_norm[:, 1] + gt_boxes_norm[:, 3] / 2) * orig_h
-
-                # Convert GT keypoints to pixel coords
-                gt_kps_pixel = gt_kps_norm.copy()
-                gt_kps_pixel[:, :, 0] *= orig_w
-                gt_kps_pixel[:, :, 1] *= orig_h
-
-                # GT bbox areas (w * h in pixels)
-                gt_areas = (gt_boxes_pixel[:, 2] - gt_boxes_pixel[:, 0]) * \
-                           (gt_boxes_pixel[:, 3] - gt_boxes_pixel[:, 1])
-
-                # Pred boxes in pixel xyxy
-                pred_boxes_pixel = np.zeros((len(pred_boxes), 4))
-                pred_boxes_pixel[:, 0] = pred_boxes[:, 0] * scale_x
-                pred_boxes_pixel[:, 1] = pred_boxes[:, 1] * scale_y
-                pred_boxes_pixel[:, 2] = pred_boxes[:, 2] * scale_x
-                pred_boxes_pixel[:, 3] = pred_boxes[:, 3] * scale_y
-
-                # Greedy matching: preds sorted by score (already sorted from postprocess)
-                matched_gt = set()
-                for pi in range(len(pred_boxes_pixel)):
-                    ious = box_iou_np(pred_boxes_pixel[pi], gt_boxes_pixel)
-                    order = np.argsort(-ious)
-                    for gi in order:
-                        if gi not in matched_gt and ious[gi] > 0.0:
-                            pred_xy = np.stack([
-                                pred_kps[pi, :, 0] * scale_x,
-                                pred_kps[pi, :, 1] * scale_y,
-                            ], axis=1)
-                            oks = compute_oks(pred_xy, gt_kps_pixel[gi], gt_areas[gi], sigmas)
-                            total_oks += oks
-                            num_oks_matched += 1
-                            matched_gt.add(gi)
-                            break
-
-    mean_oks = total_oks / max(num_oks_matched, 1)
-
-    return coco_results, num_images, timed_loader.total_inference_time, mean_oks
+    return coco_results, num_images, inference_time, mean_oks
 
 
 # ---------------------------------------------------------------------------
@@ -389,8 +286,8 @@ def parse_args():
     # Model
     p.add_argument('--checkpoint', type=str, required=True,
                    help='Path to model checkpoint (.pt)')
-    p.add_argument('--model', type=str, default='sia_pose_simple',
-                   choices=['sia_pose_coco', 'sia_pose_simple_dec', 'sia_pose_simple_dec_roi'],
+    p.add_argument('--model', type=str, default='sia_pose_coco',
+                   choices=['sia_pose_simple', 'sia_pose_simple_dec', 'sia_pose_coco'],
                    help='Model architecture')
     p.add_argument('--size', type=str, default='b16', choices=['b16', 'l14'],
                    help='Model size')
@@ -398,7 +295,7 @@ def parse_args():
                    help='Number of detection tokens')
     p.add_argument('--pose_layers', type=int, default=3,
                    help='Number of pose decoder layers')
-    p.add_argument('--num_frames', type=int, default=9,
+    p.add_argument('--num_frames', type=int, default=1,
                    help='Number of input frames (image duplicated)')
 
     # Dataset
