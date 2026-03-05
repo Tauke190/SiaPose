@@ -14,7 +14,7 @@ import logging
 import torch
 from torch import nn
 
-from .sia_vision_clip import VisionTransformer
+from ..modules.sia_vision_clip import VisionTransformer
 
 logger = logging.getLogger(__name__)
 

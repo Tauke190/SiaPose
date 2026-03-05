@@ -205,11 +205,15 @@ class Transformer(nn.Module):
         return x
 
 class VisionTransformer(nn.Module):
+    """
+    Pure Vision Encoder (ViT with 3D convolution for video).
+    
+    This encoder ONLY handles vision encoding 
+    """
     def __init__(
         self, input_resolution, patch_size, width, layers, heads, output_dim=None,
-        kernel_size=1, num_frames=9, drop_path=0, checkpoint_num=0, dropout=0.,
-        temp_embed=True, det_token_num=100,
-        num_keypoints=17, pose_decoder_layers=2, enable_pose=True,
+        kernel_size=1, num_frames=1, drop_path=0, checkpoint_num=0, dropout=0.,
+        temp_embed=True, det_token_num=20,
     ):
         super().__init__()
         self.output_dim = output_dim
@@ -257,28 +261,6 @@ class VisionTransformer(nn.Module):
             self.det_positional_embedding = nn.Parameter(scale * torch.randn(self.det_token_num, width))
             nn.init.normal_(self.det_positional_embedding, std=0.02)
 
-        # ============================================================================
-        # Pose Detection: Decoder + Keypoint Heads
-        # ============================================================================
-        self.enable_pose = enable_pose
-        self.num_keypoints = num_keypoints
-
-        if self.enable_pose and self.det_token_num > 0:
-            # Pose decoder: cross-attends to spatial features
-            self.pose_decoder = PoseDecoder(
-                d_model=width,
-                nhead=heads,
-                num_layers=pose_decoder_layers,
-                num_keypoints=num_keypoints,
-                dim_feedforward=width * 4,
-                dropout=dropout
-            )
-
-            # Keypoint prediction heads
-            # x, y coordinates (normalized 0-1)
-            self.keypoint_xy_head = MLP(width, width, 2, 3)
-            # Visibility score (0-1)
-            self.keypoint_vis_head = MLP(width, width // 2, 1, 2)
 
     def get_num_layers(self):
         return len(self.transformer.resblocks)
@@ -382,58 +364,13 @@ class VisionTransformer(nn.Module):
             det_x = self.dropout(x.reshape(H*W, T, B, C).mean(1)).permute(1, 0, 2)
 
         # ============================================================================
-        # Pose Decoder: Cross-attend detection tokens to spatial features
+        # Return encoder outputs (spatial features and detection tokens)
         # ============================================================================
-        if self.enable_pose and self.det_token_num > 0:
-            # Use pose decoder to refine detection queries and extract keypoint features
-            refined_det, keypoint_features = self.pose_decoder(det_x, spatial_features)
-            # refined_det: [B, det_token_num, D]
-            # keypoint_features: [B, det_token_num, num_keypoints, D]
-
-            # Use refined detection features for bbox/human heads
-            det_for_heads = refined_det
-        else:
-            det_for_heads = det_x
-            keypoint_features = None
-
-        # ============================================================================
-        # Output Heads
-        # ============================================================================
-        if self.proj is not None:
-            class_scores = det_for_heads @ self.proj
-        else:
-            class_scores = det_for_heads
-
-        bboxes = checkpoint.checkpoint(self.bbox_embed, det_for_heads, use_reentrant=False).sigmoid()
-        if self.det_token_num == 0:
-            box_bias = F.pad(torch.stack(torch.meshgrid(torch.linspace(0,1,W), torch.linspace(0,1,H))).reshape(2, W*H).permute(1,0), (0,2), 'constant', 0)
-            bboxes = bboxes + box_bias.to(bboxes.device)
-        human_scores = checkpoint.checkpoint(self.human_embed, det_for_heads, use_reentrant=False)
-
-        out = {'pred_logits': class_scores, 'pred_boxes': bboxes, 'human_logits': human_scores}
-
-        # ============================================================================
-        # Keypoint Predictions (if pose detection is enabled)
-        # ============================================================================
-        if self.enable_pose and keypoint_features is not None:
-            B_kp, num_det, num_kp, D_kp = keypoint_features.shape
-            # Flatten for MLP: [B * num_det * num_kp, D]
-            kp_flat = keypoint_features.view(B_kp * num_det * num_kp, D_kp)
-
-            # Predict x, y coordinates (normalized 0-1)
-            keypoints_xy = self.keypoint_xy_head(kp_flat).sigmoid()  # [B*num_det*num_kp, 2]
-            # Predict visibility scores
-            keypoints_vis = self.keypoint_vis_head(kp_flat).sigmoid()  # [B*num_det*num_kp, 1]
-
-            # Reshape to [B, num_det, num_kp, 2] and [B, num_det, num_kp, 1]
-            keypoints_xy = keypoints_xy.view(B_kp, num_det, num_kp, 2)
-            keypoints_vis = keypoints_vis.view(B_kp, num_det, num_kp, 1)
-
-            # Combine: [B, num_det, num_kp, 3] -> (x, y, visibility)
-            pred_keypoints = torch.cat([keypoints_xy, keypoints_vis], dim=-1)
-            out['pred_keypoints'] = pred_keypoints
-
-        return out
+        # NOTE: Pose decoding is NOT done here. Models handle it in their own forward passes.
+        return {
+            'spatial_features': spatial_features,
+            'det_tokens': det_x,
+        }
 
 def inflate_weight(weight_2d, time_dim, center=True):
     logger.info(f'Init center: {center}')
@@ -481,18 +418,13 @@ def load_state_dict(model, state_dict, input_resolution=224, patch_size=16, cent
 def clip_joint_b16(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
-    dropout=0.,
-    # Pose detection parameters
-    num_keypoints=17, pose_decoder_layers=2, enable_pose=True,
-):
+    dropout=0.):
     model = VisionTransformer(
         input_resolution=input_resolution, patch_size=16,
         width=768, layers=12, heads=12, output_dim=512,
         kernel_size=kernel_size, num_frames=num_frames,
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
-        # Pose detection
-        num_keypoints=num_keypoints, pose_decoder_layers=pose_decoder_layers, enable_pose=enable_pose,
     )
     # raise NotImplementedError
     if pretrained:
@@ -510,18 +442,13 @@ def clip_joint_b16(
 def clip_joint_l14(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
-    dropout=0.,
-    # Pose detection parameters
-    num_keypoints=17, pose_decoder_layers=2, enable_pose=True,
-):
+    dropout=0):
     model = VisionTransformer(
         input_resolution=input_resolution, patch_size=14,
         width=1024, layers=24, heads=16, output_dim=768,
         kernel_size=kernel_size, num_frames=num_frames,
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
-        # Pose detection
-        num_keypoints=num_keypoints, pose_decoder_layers=pose_decoder_layers, enable_pose=enable_pose,
     )
 
     if pretrained:

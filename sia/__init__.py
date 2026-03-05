@@ -1,10 +1,12 @@
-from .simple_tokenizer import SimpleTokenizer as _Tokenizer
-from .sia_pose_simple import SIA_POSE_SIMPLE, SIA_POSE_SIMPLE_DEC
-from .sia_pose_coco import SIA_POSE_SIMPLE_DEC_ROI
-from .sia_pose_heatmap import SIA_POSE_HEATMAP
-from .sia_detection_model import SIA_DETECTION_MODEL
+from .modules.simple_tokenizer import SimpleTokenizer as _Tokenizer
+from .models.sia_pose_simple import SIA_POSE_SIMPLE
+from .models.sia_pose_coco_decoder import SIA_POSE_SIMPLE_DEC
+from .models.sia_pose_coco_roi import SIA_POSE_SIMPLE_DEC_ROI
+from .models.sia_pose_coco_roi_best_so_far import SIA_POSE_SIMPLE_DEC_ROI_BEST
+from .others.sia_pose_heatmap import SIA_POSE_HEATMAP
+from .others.sia_detection_model import SIA_DETECTION_MODEL
+from .others.sia_pose_dino_simple import SIA_POSE_DINO_SIMPLE
 
-from .sia_pose_dino_simple import SIA_POSE_DINO_SIMPLE
 from torch import nn
 import torch.nn.functional as F
 from torchvision.ops import batched_nms, sigmoid_focal_loss
@@ -12,12 +14,21 @@ import numpy as np
 import cv2
 import os
 import torch
+import logging
 
 from util.box_ops import box_cxcywh_to_xyxy, generalized_box_iou
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized)
 from scipy.optimize import linear_sum_assignment
+
+logger = logging.getLogger(__name__)
+
+
+
+# ============================================================================
+# Model Wrappers
+# ============================================================================
 
 def get_sia_pose_simple(size='l',
                    pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
@@ -40,11 +51,10 @@ def get_sia_pose_simple(size='l',
     m = {'sia': sia_model}
     return m
 
-
-def get_sia_pose_simple_dec(size='l',
+def get_sia_pose_coco_decoder(size='l',
                         pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
-                        det_token_num=100,
-                        num_frames=9,
+                        det_token_num=20,
+                        num_frames=1,
                         num_keypoints=17,
                         decoder_layers=3):
     """
@@ -65,8 +75,7 @@ def get_sia_pose_simple_dec(size='l',
     m = {'sia': sia_model}
     return m
 
-
-def get_sia_pose_coco(size='l',
+def get_sia_pose_coco_roi(size='l',
                         pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
                         det_token_num=100,
                         num_frames=1,
@@ -86,6 +95,44 @@ def get_sia_pose_coco(size='l',
                          14 = 196 tokens per detection. 0 = fallback to variable-length.
     """
     sia_model = SIA_POSE_SIMPLE_DEC_ROI(
+        size=size,
+        pretrain=pretrain,
+        det_token_num=det_token_num,
+        num_frames=num_frames,
+        num_keypoints=num_keypoints,
+        decoder_layers=decoder_layers,
+        max_roi_cap=max_roi_cap,
+        roi_output_size=roi_output_size,
+    )
+    m = {'sia': sia_model}
+    return m
+
+def get_sia_pose_coco_roi_best(size='l',
+                        pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
+                        det_token_num=100,
+                        num_frames=1,
+                        num_keypoints=17,
+                        decoder_layers=3,
+                        max_roi_cap=0,
+                        roi_output_size=14):
+    """
+    Get SIA pose model with optimized ROI-based pose decoder (SIA_POSE_SIMPLE_DEC_ROI_BEST).
+
+    This model uses an optimized ROI decoder variant with:
+    - Unified query tokens for detection + pose (perfect alignment)
+    - Self-attention among pose queries (global context)
+    - Cross-attention to per-detection ROI features via roi_align
+    - FlashAttention support (when roi_mask=None)
+
+    Detection tokens stay in encoder -> bboxes.
+    Pose queries cross-attend only to ROI spatial features extracted via roi_align.
+
+    Args:
+        max_roi_cap: legacy, unused when roi_output_size > 0.
+        roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
+                         14 = 196 tokens per detection. 0 = fallback to variable-length.
+    """
+    sia_model = SIA_POSE_SIMPLE_DEC_ROI_BEST(
         size=size,
         pretrain=pretrain,
         det_token_num=det_token_num,
@@ -129,7 +176,6 @@ def get_sia_pose_posetrack(size='l',
     )
     m = {'sia': sia_model}
     return m
-
 
 
 ###################################
@@ -587,17 +633,18 @@ class SetCriterion(nn.Module):
             losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, num_classes))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
+        # Only compute keypoint losses for auxiliary outputs, not detection losses
+        # (detection losses are computed from the main output only, to avoid triple-counting)
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
-                indices = self.matcher(aux_outputs, targets)
                 for loss in self.losses:
-                    if loss == 'masks':
-                        # Intermediate masks losses are too costly to compute, we ignore them.
+                    # Skip detection losses for auxiliary layers (boxes, human, labels)
+                    # Only compute keypoint losses, which vary across decoder layers
+                    if loss in ['boxes', 'human', 'labels', 'masks']:
                         continue
+                    # For keypoint losses, still need indices from matching
+                    # Use the main layer's indices since detection is the same
                     kwargs = {}
-                    if loss == 'labels':
-                        # Logging is enabled only for the last layer
-                        kwargs = {'log': False}
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, num_classes, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
@@ -808,7 +855,7 @@ class PostProcessPose(nn.Module):
                 torch.zeros(len(human_scores_kept)).to(human_scores_kept.device), 0.5
             )
             human_scores_kept = human_scores_kept[nms_idx]
-            boxes_kept = boxes_kept[nms_idx].int()
+            boxes_kept = boxes_kept[nms_idx]  # Keep float precision; rescaling to original coords handles conversion
             if keypoints_kept is not None:
                 keypoints_kept = keypoints_kept[nms_idx]
                 # Zero out low-confidence keypoint visibility

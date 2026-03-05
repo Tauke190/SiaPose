@@ -48,8 +48,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SIA for Pose Estimation on COCO")
 
     # Model
-    parser.add_argument("-MODEL", type=str, default='sia_pose_simple', choices=['sia_pose_simple', 'sia_pose_coco_decoder', 'sia_pose_coco_roi', 'sia_pose_coco_roi_best'],
-                        help="Model type: sia_pose_simple / sia_pose_coco_decoder / sia_pose_coco_roi / sia_pose_coco_roi_best")
+    parser.add_argument("-MODEL", type=str, default='pose', choices=['sia_pose_coco', 'sia_pose_simple', 'sia_pose_heatmap', 'sia_pose_dino', 'sia_pose_dino_simple', 'sia_pose_coco', 'sia_pose_posetrack'],
+                        help="Model type: 'sia_pose' (det tokens in encoder), 'sia_pose_simple' (no decoder), 'sia_pose_simple_dec' (lightweight decoder), 'sia_pose_simple_dec_roi' (ROI decoder), 'sia_pose_coco' (COCO ROI decoder), 'sia_pose_posetrack' (PoseTrack ROI decoder), 'sia_pose_dino' (DINOv2 + LED), 'sia_pose_dino_simple' (DINOv2 encoder-only)")
     parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14', 'dino_b14', 'dino_l14'],
                         help="Model size: b16/l14 (ViCLIP), dino_b14/dino_l14 (DINOv2)")
     parser.add_argument("-FRAMES", type=int, default=1,
@@ -89,7 +89,7 @@ def parse_args():
     parser.add_argument("-WEIGHT_DECAY", type=float, default=1e-4,
                         help="Weight decay")
     parser.add_argument("-GRAD_CLIP", type=float, default=1.0,
-                        help="Gradient clipping max norm (0 = disabled). Reduced to 1.0 for stable training with unified tokens.")
+                        help="Gradient clipping max norm (0 = disabled)")
 
     # Input size
     parser.add_argument("-WIDTH", type=int, default=640,
@@ -97,6 +97,7 @@ def parse_args():
     parser.add_argument("-HEIGHT", type=int, default=480,
                         help="Input height")
 
+    # Loss weights
     parser.add_argument("-W_BBOX", type=float, default=5.0,
                         help="Weight for bbox L1 loss")
     parser.add_argument("-W_GIOU", type=float, default=2.0,
@@ -226,9 +227,9 @@ def build_model(args, rank):
             num_frames=args.FRAMES,
             num_keypoints=17,
         )['sia']
-    elif args.MODEL == 'sia_pose_coco_decoder':
+    elif args.MODEL == 'sia_pose_simple_dec':
         # Lightweight decoder: pose queries cross-attend to encoder spatial features
-        model = get_sia_pose_coco_decoder(
+        model = get_sia_pose_simple_dec(
             size=size,
             pretrain=pretrain,
             det_token_num=args.DET,
@@ -236,21 +237,9 @@ def build_model(args, rank):
             num_keypoints=17,
             decoder_layers=args.POSE_LAYERS,
         )['sia']
-    elif args.MODEL == 'sia_pose_coco_roi':
+    elif args.MODEL == 'sia_pose_coco':
         # ROI-based decoder: pose queries cross-attend only to ROI features
-        model = get_sia_pose_coco_roi(
-            size=size,
-            pretrain=pretrain,
-            det_token_num=args.DET,
-            num_frames=args.FRAMES,
-            num_keypoints=17,
-            decoder_layers=args.POSE_LAYERS,
-            max_roi_cap=args.MAX_ROI_CAP,
-            roi_output_size=args.ROI_SIZE,
-        )['sia']
-    elif args.MODEL == 'sia_pose_coco_roi_best':
-        # ROI-based decoder (optimized): uses roi_align for faster CUDA-accelerated ROI extraction
-        model = get_sia_pose_coco_roi_best(
+        model = get_sia_pose_coco(
             size=size,
             pretrain=pretrain,
             det_token_num=args.DET,
@@ -302,13 +291,11 @@ def build_criterion(args, rank):
     }
 
     # Add auxiliary loss weights for intermediate decoder layers
-    # Only include keypoint losses (not detection), since detection uses reused predictions
-    # This prevents triple-counting of detection losses while allowing keypoint refinement
+    # Each intermediate layer gets the same weights (DETR convention)
     num_aux_layers = max(0, args.POSE_LAYERS - 1)
     for i in range(num_aux_layers):
-        # Only add weights for keypoint-related losses in auxiliary layers
-        weight_dict[f'loss_keypoints_{i}'] = args.W_KP
-        weight_dict[f'loss_keypoint_vis_{i}'] = args.W_KP_VIS
+        for k, v in list(weight_dict.items()):
+            weight_dict[f'{k}_{i}'] = v
 
     # Heatmap model uses global heatmap loss instead of per-instance RLE loss
     if args.MODEL == 'sia_pose_heatmap':
@@ -322,7 +309,7 @@ def build_criterion(args, rank):
     criterion = SetCriterion(
         matcher=matcher,
         weight_dict=weight_dict,
-        eos_coef=0.3, # Increased from 0.1 to better suppress false positives and encourage sparse detections
+        eos_coef=0.3, # Suppressing  false positives more
         losses=losses_list,
         num_keypoints=num_kp  # COCO has 17 keypoints, needed for RLE loss sigma
     )
@@ -339,7 +326,7 @@ def freeze_encoder(model):
     for name, param in model.named_parameters():
         # Keep pose/detection heads trainable, freeze backbone
         if any(k in name for k in [
-            'pose_decoder', 'keypoint', 'pose_decoder_ln',  # pose estimation heads
+            'pose_decoder', 'keypoint', 'pose_token', 'pose_positional',  # existing patterns
             'led_decoder', 'human_embed', 'bbox_embed',                    # LED/DINOv2 heads
             'temporal_positional_embedding', 'ln_post',                    # DINOv2-specific
             'heatmap_decoder',                                             # heatmap decoder
@@ -405,14 +392,11 @@ def count_parameters(model):
     return trainable_params, frozen_params
 
 
-def build_optimizer(model, args, criterion=None):
+def build_optimizer(model, args):
     """Build optimizer with separate learning rates for backbone and heads."""
     if args.FREEZE_BACKBONE:
         # Backbone frozen — single group of trainable params
         trainable_params = [p for p in model.parameters() if p.requires_grad]
-        # Add criterion parameters (e.g., log_sigma for RLE loss)
-        if criterion is not None and hasattr(criterion, 'log_sigma'):
-            trainable_params.append(criterion.log_sigma)
         optimizer = torch.optim.AdamW(trainable_params, lr=args.LR, weight_decay=args.WEIGHT_DECAY)
     else:
         # Backbone unfrozen — two param groups with different LRs
@@ -425,7 +409,7 @@ def build_optimizer(model, args, criterion=None):
                     'led_decoder' in name or 'human_head' in name or
                     'box_head' in name or 'det_token' in name or
                     'det_positional' in name or
-                    'pose_decoder_ln' in name or
+                    'pose_token' in name or 'pose_positional' in name or
                     'human_embed' in name or 'bbox_embed' in name or
                     'temporal_positional_embedding' in name or 'ln_post' in name or
                     'heatmap_decoder' in name or
@@ -435,10 +419,6 @@ def build_optimizer(model, args, criterion=None):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
-
-        # Add criterion parameters (e.g., log_sigma for RLE loss) to head_params
-        if criterion is not None and hasattr(criterion, 'log_sigma'):
-            head_params.append(criterion.log_sigma)
 
         optimizer = torch.optim.AdamW([
             {'params': backbone_params, 'lr': args.LR_BACKBONE},
@@ -557,13 +537,6 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                     if k in weight_dict:
                         wandb_metrics[f'train/{k}'] = v.item()
 
-                # Monitor RLE sigma (learnable uncertainty in keypoint loss)
-                if hasattr(criterion, 'log_sigma'):
-                    log_sigma = criterion.log_sigma.detach().cpu()
-                    wandb_metrics['train/sigma_min'] = log_sigma.min().item()
-                    wandb_metrics['train/sigma_max'] = log_sigma.max().item()
-                    wandb_metrics['train/sigma_mean'] = log_sigma.mean().item()
-
                 wandb.log(wandb_metrics, step=global_step)
 
             # Log detailed losses to console every LOG steps
@@ -573,17 +546,6 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                 for k, v in loss_dict.items():
                     if k in weight_dict:
                         log_msg += f" | {k}: {v.item():.4f}"
-
-                # Monitor RLE sigma for divergence detection
-                if hasattr(criterion, 'log_sigma'):
-                    log_sigma = criterion.log_sigma.detach().cpu()
-                    sigma_max = log_sigma.max().item()
-                    sigma_mean = log_sigma.mean().item()
-                    log_msg += f" | sigma_max: {sigma_max:.3f} sigma_mean: {sigma_mean:.3f}"
-
-                    # Warn if sigma grows too large (divergence risk)
-                    if sigma_max > 2.0:
-                        log_msg += f" [WARNING: High sigma detected]"
 
                 if rank == 0:
                     print(log_msg, flush=True)
@@ -802,8 +764,8 @@ def main(args):
     # Build criterion
     criterion, weight_dict = build_criterion(args, device)
 
-    # Build optimizer (pass criterion so log_sigma gets included)
-    optimizer = build_optimizer(model, args, criterion=criterion)
+    # Build optimizer
+    optimizer = build_optimizer(model, args)
 
     # Build scheduler with linear warmup (10 epochs) + flat hold (15 epochs) + cosine annealing
     scheduler = build_scheduler(optimizer, total_epochs=args.EPOCH, warmup_epochs=10, flat_epochs=15)

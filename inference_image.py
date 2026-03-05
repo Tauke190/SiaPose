@@ -11,7 +11,7 @@ import cv2
 import torch
 from torchvision.transforms import v2
 from sia import (
-    get_sia_pose_simple,get_sia_pose_simple_dec,
+    get_sia_pose_simple,get_sia_pose_simple_dec,get_sia_pose_coco,
     PostProcessPose, COCO_SKELETON, COCO_KEYPOINT_NAMES
 )
 
@@ -80,6 +80,14 @@ def build_model(args):
             num_frames=args.num_frames,
             num_keypoints=17,
         )['sia']
+    elif args.model == 'sia_pose_coco':
+        model = get_sia_pose_coco(
+            size=size,
+            pretrain=None,
+            det_token_num=args.det_tokens,
+            num_frames=args.num_frames,
+            num_keypoints=17,
+        )['sia']
     elif args.model == 'sia_pose_simple_dec':
         model = get_sia_pose_simple_dec(
             size=size,
@@ -104,7 +112,7 @@ def parse_args():
     parser.add_argument("--checkpoint_path", type=str, default=DEFAULT_WEIGHT_PATH,
                         help="Path to model checkpoint/weights (.pt file)")
     parser.add_argument("--model", type=str, default="sia_pose",
-                        choices=["sia_pose", "sia_pose_simple", "sia_pose_decoder_led"],
+                        choices=["sia_pose_coco", "sia_pose_simple", "sia_pose_decoder_led"],
                         help="Model architecture variant")
     parser.add_argument("--size", type=str, default="b16", choices=["b16", "l14"],
                         help="Model size: b16 (ViT-B/16) or l14 (ViT-L/14)")

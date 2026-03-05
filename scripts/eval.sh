@@ -8,7 +8,7 @@
 #   CHECKPOINT=weights/my_model.pt MODEL=sia_pose bash scripts/eval.sh
 
 CHECKPOINT=${CHECKPOINT:-"weights/sia_pose_coco_b16_best.pt"}
-MODEL=${MODEL:-"sia_pose_coco"}
+MODEL=${MODEL:-"sia_pose_coco_roi_best"}
 SIZE=${SIZE:-"b16"}
 DATASET=${DATASET:-"coco"}
 BATCH_SIZE=${BATCH_SIZE:-32}

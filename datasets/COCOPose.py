@@ -207,9 +207,11 @@ class COCOPose(Dataset):
 
         # --- Augmentations (training only) ---
         if self.augment and len(boxes_pixel) > 0:
-            # 1. Random scale and rotation (stronger values for better generalization)
-            scale = random.uniform(0.65, 1.35)
-            angle = random.uniform(-40, 40)
+            # 1. Random scale and rotation (balanced for stability and generalization)
+            # Reduced from [0.65-1.35] to [0.75-1.25] for faster convergence
+            # Reduced from [±40°] to [±30°] to maintain pose structure
+            scale = random.uniform(0.75, 1.25)
+            angle = random.uniform(-30, 30)
             img, boxes_pixel, kps_pixel = self._apply_scale_rotation(
                 img, boxes_pixel, kps_pixel, scale, angle, img_w, img_h
             )

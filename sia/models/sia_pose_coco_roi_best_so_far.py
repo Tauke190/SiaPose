@@ -24,7 +24,7 @@ from torch import nn
 import torch.nn.functional as F
 from torchvision.ops import roi_align
 
-from .sia_vision_clip import (
+from ..modules.sia_vision_clip import (
     VisionTransformer, MLP, inflate_weight, load_state_dict,
     _MODELS, PoseDecoderLayer
 )
@@ -229,9 +229,6 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             dropout=dropout,
             temp_embed=temp_embed,
             det_token_num=det_token_num,
-            num_keypoints=num_keypoints,
-            pose_decoder_layers=0,
-            enable_pose=False,
         )
 
         self.num_keypoints = num_keypoints
@@ -523,7 +520,7 @@ def interpolate_pos_embed_vit(state_dict, new_model):
 # Wrapper class
 # ============================================================================
 
-class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
+class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
     """
     SIA Pose Model with ROI-based pose decoder.
 
@@ -543,7 +540,7 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
                  decoder_layers=3,
                  max_roi_cap=0,
                  roi_output_size=14):
-        super(SIA_POSE_SIMPLE_DEC_ROI, self).__init__()
+        super(SIA_POSE_SIMPLE_DEC_ROI_BEST, self).__init__()
 
         if size.lower() == 'l':
             self.vision_encoder_name = 'vit_l14'

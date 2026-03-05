@@ -10,7 +10,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from .sia_vision_clip import MLP
+from ..modules.sia_vision_clip import MLP
 
 logger = logging.getLogger(__name__)
 

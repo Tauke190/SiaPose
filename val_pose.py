@@ -29,7 +29,7 @@ from torchvision.transforms import v2
 from tqdm import tqdm
 
 from sia import (
-    get_sia_pose_simple, get_sia_pose_simple_dec,get_sia_pose_coco,
+    get_sia_pose_coco_decoder, get_sia_pose_coco_roi, get_sia_pose_coco_roi_best,
     PostProcessPose, COCO_KEYPOINT_NAMES,
 )
 from datasets import COCOPoseVal, PoseTrackPoseVal
@@ -189,26 +189,32 @@ def get_dataset(args, transforms):
 # ---------------------------------------------------------------------------
 
 def build_model(args):
-    """Instantiate the model (without pretrained backbone weights)."""
+    """Instantiate the model (without pretrained backbone weights).
+
+    Only supports the training models:
+    - sia_pose_simple_dec: Unified query tokens with pose decoder (NEW, recommended)
+    - sia_pose_coco_roi: ROI-based pose estimation
+    """
     size = 'b' if args.size == 'b16' else 'l'
 
-    if args.model == 'sia_pose_simple':
-        model = get_sia_pose_simple(
-            size=size, pretrain=None,
-            det_token_num=args.det_tokens,
-            num_frames=args.num_frames,
-            num_keypoints=17,
-        )['sia']
-    elif args.model == 'sia_pose_simple_dec':
-        model = get_sia_pose_simple_dec(
+    if args.model == 'sia_pose_simple_dec':
+        model = get_sia_pose_coco_decoder(
             size=size, pretrain=None,
             det_token_num=args.det_tokens,
             num_frames=args.num_frames,
             num_keypoints=17,
             decoder_layers=args.pose_layers,
         )['sia']
-    elif args.model == 'sia_pose_coco':
-        model = get_sia_pose_coco(
+    elif args.model == 'sia_pose_coco_roi':
+        model = get_sia_pose_coco_roi(
+            size=size, pretrain=None,
+            det_token_num=args.det_tokens,
+            num_frames=args.num_frames,
+            num_keypoints=17,
+            decoder_layers=args.pose_layers,
+        )['sia']
+    elif args.model == 'sia_pose_coco_roi_best':
+        model = get_sia_pose_coco_roi_best(
             size=size, pretrain=None,
             det_token_num=args.det_tokens,
             num_frames=args.num_frames,
@@ -216,7 +222,7 @@ def build_model(args):
             decoder_layers=args.pose_layers,
         )['sia']
     else:
-        raise ValueError(f"Unknown model: {args.model}")
+        raise ValueError(f"Unknown model: {args.model}. Supported: sia_pose_simple_dec, sia_pose_coco_roi, sia_pose_coco_roi_best")
 
     return model
 
@@ -286,9 +292,8 @@ def parse_args():
     # Model
     p.add_argument('--checkpoint', type=str, required=True,
                    help='Path to model checkpoint (.pt)')
-    p.add_argument('--model', type=str, default='sia_pose_coco',
-                   choices=['sia_pose_simple', 'sia_pose_simple_dec', 'sia_pose_coco'],
-                   help='Model architecture')
+    p.add_argument("--model", type=str, default='sia_pose_simple_dec', choices=['sia_pose_simple_dec', 'sia_pose_coco_roi', 'sia_pose_coco_roi_best'],
+                    help="Model type: sia_pose_simple_dec / sia_pose_coco_roi / sia_pose_coco_roi_best")
     p.add_argument('--size', type=str, default='b16', choices=['b16', 'l14'],
                    help='Model size')
     p.add_argument('--det_tokens', type=int, default=20,
