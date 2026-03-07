@@ -18,7 +18,7 @@ CUDA_VISIBLE_DEVICES=0,2 torchrun --nproc_per_node=2 train_pose.py \
        -ROOT /mnt/SSD2/coco2017/images \
        -TRAIN_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_train2017.json \
        -VAL_ANN /mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json \
-       -BS 64 -EPOCH 150 -LR 5e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 100 -LOG 10 -WORKERS 12 -LR_BACKBONE 1e-5 -DET 20 -GRAD_CLIP 1 \
+       -BS 64 -EPOCH 150 -LR 5e-4 --SAVE -FRAMES 1 -VAL_BATCH_FREQ 10 -LOG 5 -WORKERS 12 -LR_BACKBONE 1e-5 -DET 20 -GRAD_CLIP 1 \
        -HEIGHT 480 -WIDTH 640 \
        --RESUME weights/avak_b16_11.pt \
        -POSE_LAYERS 3 -ROI_SIZE 14 2>&1 | tee "$LOG_FILE"

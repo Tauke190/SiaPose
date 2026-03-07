@@ -3,6 +3,7 @@ from .models.sia_pose_simple import SIA_POSE_SIMPLE
 from .models.sia_pose_coco_decoder import SIA_POSE_SIMPLE_DEC
 from .models.sia_pose_coco_roi import SIA_POSE_SIMPLE_DEC_ROI
 from .models.sia_pose_coco_roi_best_so_far import SIA_POSE_SIMPLE_DEC_ROI_BEST
+from .models.sia_pos_eomt import SIA_POSE_EOMT
 from .others.sia_pose_heatmap import SIA_POSE_HEATMAP
 from .others.sia_detection_model import SIA_DETECTION_MODEL
 from .others.sia_pose_dino_simple import SIA_POSE_DINO_SIMPLE
@@ -177,6 +178,35 @@ def get_sia_pose_posetrack(size='l',
     m = {'sia': sia_model}
     return m
 
+def get_sia_pose_eomt(size='l',
+                      pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
+                      pose_token_num=100,
+                      num_frames=9,
+                      num_keypoints=17,
+                      stage2_layers=3):
+    """
+    Get EOMT-based SIA pose model with two-stage encoding.
+
+    Architecture: Pretrained ViT split into Stage 1 (patches only) and
+    Stage 2 (patches + learnable pose tokens jointly). Both stages use
+    pretrained encoder blocks with standard self-attention.
+
+    Args:
+        pose_token_num: Number of learnable pose tokens (queries)
+        stage2_layers: Number of pretrained ViT blocks allocated to Stage 2 (L₂).
+                       Stage 1 gets (total_layers - stage2_layers) blocks.
+    """
+    sia_model = SIA_POSE_EOMT(
+        size=size,
+        pretrain=pretrain,
+        pose_token_num=pose_token_num,
+        num_frames=num_frames,
+        num_keypoints=num_keypoints,
+        stage2_layers=stage2_layers,
+    )
+    m = {'sia': sia_model}
+    return m
+
 
 ###################################
 # For closed-set action detection #
@@ -232,7 +262,8 @@ class HungarianMatcher(nn.Module):
             For each batch element, it holds:
                 len(index_i) = len(index_j) = min(num_queries, num_target_boxes)
         """
-        bs, num_queries = outputs["pred_logits"].shape[:2]
+        # Get batch size and num_queries from human_logits (works for all models including EOMT)
+        bs, num_queries = outputs["human_logits"].shape[:2]
 
         # We flatten to compute the cost matrices in a batch
         out_bbox = outputs["pred_boxes"].flatten(0, 1)  # [batch_size * num_queries, 4]
@@ -384,7 +415,12 @@ class SetCriterion(nn.Module):
     def loss_cardinality(self, outputs, targets, indices, num_boxes, num_classes): #quick fix for num_classes for loss_label
         """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
+        Only applicable for models with pred_logits (multi-class classification).
         """
+        # Skip if pred_logits not available (e.g., EOMT model with only human detection)
+        if 'pred_logits' not in outputs:
+            return {}
+
         pred_logits = outputs['pred_logits']
         device = pred_logits.device
         tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
@@ -658,20 +694,13 @@ class PostProcess(nn.Module):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
-            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
-                          For evaluation, this must be the original image size (before any data augmentation)
-                          For visualization, this should be the image size after data augment, but before padding
+            imgsize: tuple of (height, width) of the original image
         """
-        out_human, out_logits, out_bbox = outputs['human_logits'], outputs['pred_logits'], outputs['pred_boxes']
-
-        if Aaug is not None:
-            out_logits = out_logits @ Aaug
+        out_human, out_bbox = outputs['human_logits'], outputs['pred_boxes']
 
         human_prob = F.softmax(out_human, -1)
         human_scores, human_labels = human_prob[...,].max(-1)
-        
-        prob = out_logits
-        
+
         boxes = box_cxcywh_to_xyxy(out_bbox)
         scale_fct = torch.tensor([imgsize[1], imgsize[0], imgsize[1], imgsize[0]]).to(boxes.device)
         boxes = boxes * scale_fct
@@ -679,39 +708,23 @@ class PostProcess(nn.Module):
         results = []
         bs = out_human.shape[0]
         for i in range(bs):
-            human_idx = torch.where(human_labels[i] == 0) # obtain boxes where human is detected
-            human_scores_kept = human_scores[i][human_idx] # filter boxes where human is detected
-            prob_kept = prob[i][human_idx]
+            # Filter for detected humans (class 0)
+            human_idx = torch.where(human_labels[i] == 0)
+            human_scores_kept = human_scores[i][human_idx]
             boxes_kept = boxes[i][human_idx]
-            
-            human_idx = torch.where(human_scores_kept >= human_conf) # obtain boxes where human conf > thresh (default=0.7)
-            human_scores_kept = human_scores_kept[human_idx] # filter boxes where human is detected
-            prob_kept = prob_kept[human_idx]
+
+            # Filter by human confidence threshold
+            human_idx = torch.where(human_scores_kept >= human_conf)
+            human_scores_kept = human_scores_kept[human_idx]
             boxes_kept = boxes_kept[human_idx]
-            
-            human_idx = batched_nms(boxes_kept, human_scores_kept, torch.zeros(len(human_scores_kept)).to(human_scores_kept.device), 0.5) # extra NMS
-            human_scores_kept = human_scores_kept[human_idx] # filter boxes where human is detected
-            prob_kept = prob_kept[human_idx]
+
+            # Apply NMS to remove overlapping boxes
+            human_idx = batched_nms(boxes_kept, human_scores_kept, torch.zeros(len(human_scores_kept)).to(human_scores_kept.device), 0.5)
+            human_scores_kept = human_scores_kept[human_idx]
             boxes_kept = boxes_kept[human_idx].int()
 
-            final_scores = []
-            final_labels = []
-            finalboxes = []
-            for i in range(len(human_idx)):
-                box = boxes_kept[i]
-                gt = torch.where(prob_kept[i] >= thresh)[0]
-                gt_conf = (prob_kept[i][gt] + 1) / 2
-                final_scores.extend(gt_conf)
-                final_labels.extend(gt)
-                for _ in range(len(gt)):
-                    finalboxes.append(box)
-            final_scores = torch.stack(final_scores) if len(final_scores) != 0 else torch.empty(0)
-            final_labels = torch.stack(final_labels) if len(final_labels) != 0 else torch.empty(0)
-            finalboxes = torch.stack(finalboxes) if len(finalboxes) != 0 else torch.empty(0)
-            
-            results.append({'scores': final_scores,
-                            'labels': final_labels,
-                            'boxes': finalboxes})
+            results.append({'scores': human_scores_kept,
+                            'boxes': boxes_kept})
 
         return results
 
@@ -722,22 +735,13 @@ class PostProcessViz(nn.Module):
         """ Perform the computation
         Parameters:
             outputs: raw outputs of the model
-            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
-                          For evaluation, this must be the original image size (before any data augmentation)
-                          For visualization, this should be the image size after data augment, but before padding
+            imgsize: tuple of (height, width) of the original image
         """
-        out_human, out_logits, out_bbox = outputs['human_logits'], outputs['pred_logits'], outputs['pred_boxes']
-
-        if Aaug is not None:
-            out_logits = out_logits @ Aaug
+        out_human, out_bbox = outputs['human_logits'], outputs['pred_boxes']
 
         human_prob = F.softmax(out_human, -1)
         human_scores, human_labels = human_prob[...,].max(-1)
-        
-        #prob = F.sigmoid(out_logits)
-        prob = out_logits
-        #scores, labels = prob.max(-1)
-        
+
         boxes = box_cxcywh_to_xyxy(out_bbox)
         scale_fct = torch.tensor([imgsize[1], imgsize[0], imgsize[1], imgsize[0]]).to(boxes.device)
         boxes = boxes * scale_fct
@@ -745,44 +749,23 @@ class PostProcessViz(nn.Module):
         results = []
         bs = out_human.shape[0]
         for i in range(bs):
-            human_idx = torch.where(human_labels[i] == 0) # obtain boxes where human is detected
-            human_scores_kept = human_scores[i][human_idx] # filter boxes where human is detected
-            #scores_kept = scores[i][human_idx] # obtain boxes where human is detected
-            #labels_kept = labels[i][human_idx]
-            prob_kept = prob[i][human_idx]
+            # Filter for detected humans (class 0)
+            human_idx = torch.where(human_labels[i] == 0)
+            human_scores_kept = human_scores[i][human_idx]
             boxes_kept = boxes[i][human_idx]
-            
-            human_idx = torch.where(human_scores_kept >= human_conf) # obtain boxes where human conf > thresh (default=0.7)
-            human_scores_kept = human_scores_kept[human_idx] # filter boxes where human is detected
-            #scores_kept = scores_kept[human_idx] # obtain boxes where human is detected
-            #labels_kept = labels_kept[human_idx]
-            prob_kept = prob_kept[human_idx]
+
+            # Filter by human confidence threshold
+            human_idx = torch.where(human_scores_kept >= human_conf)
+            human_scores_kept = human_scores_kept[human_idx]
             boxes_kept = boxes_kept[human_idx]
-            
-            human_idx = batched_nms(boxes_kept, human_scores_kept, torch.zeros(len(human_scores_kept)).to(human_scores_kept.device), 0.5) # extra NMS
-            human_scores_kept = human_scores_kept[human_idx] # filter boxes where human is detected
-            #scores_kept = scores_kept[human_idx] # obtain boxes where human is detected
-            #labels_kept = labels_kept[human_idx]
-            prob_kept = prob_kept[human_idx]
+
+            # Apply NMS to remove overlapping boxes
+            human_idx = batched_nms(boxes_kept, human_scores_kept, torch.zeros(len(human_scores_kept)).to(human_scores_kept.device), 0.5)
+            human_scores_kept = human_scores_kept[human_idx]
             boxes_kept = boxes_kept[human_idx].int()
 
-            final_scores = []
-            final_labels = []
-            finalboxes = []
-            for i in range(len(human_idx)):
-                box = boxes_kept[i]
-                gt = torch.where(prob_kept[i] >= thresh)[0]
-                gt_conf = (prob_kept[i][gt] + 1) / 2
-                final_scores.append(gt_conf)
-                final_labels.append(gt)
-                finalboxes.append(box)
-            #final_scores = torch.stack(final_scores)
-            #final_labels = torch.stack(final_labels)
-            #finalboxes = torch.stack(finalboxes)
-
-            results.append({'scores': final_scores,
-                            'labels': final_labels,
-                            'boxes': finalboxes})
+            results.append({'scores': human_scores_kept,
+                            'boxes': boxes_kept})
 
         return results
 
@@ -792,7 +775,7 @@ class PostProcessPose(nn.Module):
     Only processes human detection and keypoints - no action class dependencies.
     """
     @torch.no_grad()
-    def forward(self, outputs, imgsize, human_conf=0.7, keypoint_conf=0.5):
+    def forward(self, outputs, imgsize, human_conf=0.5, keypoint_conf=0.3):
         """Perform pose post-processing.
 
         Parameters:

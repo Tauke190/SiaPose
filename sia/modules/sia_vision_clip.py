@@ -85,59 +85,6 @@ class PoseDecoderLayer(nn.Module):
         queries = queries + self.ffn(self.norm3(queries))
         return queries
 
-
-class PoseDecoder(nn.Module):
-    """Full pose decoder with detection refinement + keypoint localization"""
-    def __init__(self, d_model=1024, nhead=8, num_layers=2, num_keypoints=17, dim_feedforward=2048, dropout=0.1):
-        super().__init__()
-        self.num_keypoints = num_keypoints
-
-        # Learnable keypoint embeddings (one per joint type)
-        self.keypoint_embed = nn.Parameter(torch.zeros(num_keypoints, d_model))
-        nn.init.normal_(self.keypoint_embed, std=0.02)
-
-        # Decoder layers for detection refinement
-        self.layers = nn.ModuleList([
-            PoseDecoderLayer(d_model, nhead, dim_feedforward, dropout) for _ in range(num_layers)
-        ])
-
-        # Keypoint-specific layer (after expanding to per-detection keypoints)
-        self.keypoint_layer = PoseDecoderLayer(d_model, nhead, dim_feedforward, dropout)
-
-    def forward(self, det_queries, spatial_features):
-        """
-        det_queries: [B, num_det, D] - initial detection tokens from encoder
-        spatial_features: [B, H*W*T, D] - encoder spatial output (NOT discarded)
-        Returns:
-            refined_det: [B, num_det, D] - refined detection features
-            keypoint_features: [B, num_det, num_keypoints, D] - per-detection keypoint features
-        """
-        B, num_det, D = det_queries.shape
-
-        # Stage 1: Refine detection queries via cross-attention to spatial features
-        for layer in self.layers:
-            det_queries = layer(det_queries, spatial_features)
-
-        # Stage 2: Expand to keypoint queries (one set of num_keypoints per detection)
-        # keypoint_embed: [num_keypoints, D] → [B, num_det, num_keypoints, D]
-        kp_queries = self.keypoint_embed.unsqueeze(0).unsqueeze(0).expand(B, num_det, -1, -1)
-
-        # Condition keypoints on their parent detection
-        kp_queries = kp_queries + det_queries.unsqueeze(2)  # [B, num_det, num_keypoints, D]
-
-        # Flatten for attention: [B, num_det*num_keypoints, D]
-        # Use contiguous() + view() or reshape() to handle non-contiguous tensors
-        kp_queries = kp_queries.contiguous().view(B, num_det * self.num_keypoints, D)
-
-        # Cross-attend to spatial features for precise localization
-        kp_queries = self.keypoint_layer(kp_queries, spatial_features)
-
-        # Reshape back: [B, num_det, num_keypoints, D]
-        keypoint_features = kp_queries.view(B, num_det, self.num_keypoints, D)
-
-        return det_queries, keypoint_features
-
-
 class QuickGELU(nn.Module):
     def forward(self, x):
         return x * torch.sigmoid(1.702 * x)

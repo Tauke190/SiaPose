@@ -201,7 +201,7 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
                     kps_flat.extend([
                         float(kps[ki, 0]) * scale_x,
                         float(kps[ki, 1]) * scale_y,
-                        2 if float(kps[ki, 2]) > 0.3 else 0,
+                        2 if float(kps[ki, 2]) > keypoint_conf else 0,
                     ])
                 coco_results.append({
                     'image_id': image_id,

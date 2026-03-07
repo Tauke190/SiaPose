@@ -20,7 +20,7 @@ from torch.utils.data.distributed import DistributedSampler
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.distributed as dist
 
-from sia import get_sia_pose_simple, get_sia_pose_coco_decoder, get_sia_pose_coco_roi, get_sia_pose_coco_roi_best, get_sia_pose_posetrack, HungarianMatcher, SetCriterion, PostProcessPose
+from sia import get_sia_pose_simple, get_sia_pose_coco_decoder, get_sia_pose_coco_roi, get_sia_pose_coco_roi_best, get_sia_pose_posetrack, get_sia_pose_eomt, HungarianMatcher, SetCriterion, PostProcessPose
 from datasets import COCOPose, COCOPoseVal, PoseTrackPose, PoseTrackPoseVal
 from val_utils import COCO_SIGMAS, compute_oks, box_iou_np, run_coco_eval
 
@@ -48,8 +48,8 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train SIA for Pose Estimation on COCO")
 
     # Model
-    parser.add_argument("-MODEL", type=str, default='sia_pose_simple', choices=['sia_pose_simple', 'sia_pose_coco_decoder', 'sia_pose_coco_roi', 'sia_pose_coco_roi_best'],
-                        help="Model type: sia_pose_simple / sia_pose_coco_decoder / sia_pose_coco_roi / sia_pose_coco_roi_best")
+    parser.add_argument("-MODEL", type=str, default='sia_pose_simple', choices=['sia_pose_simple', 'sia_pose_coco_decoder', 'sia_pose_coco_roi', 'sia_pose_coco_roi_best', 'sia_pose_eomt'],
+                        help="Model type: sia_pose_simple / sia_pose_coco_decoder / sia_pose_coco_roi / sia_pose_coco_roi_best / sia_pose_eomt")
     parser.add_argument("-SIZE", type=str, default='b16', choices=['b16', 'l14', 'dino_b14', 'dino_l14'],
                         help="Model size: b16/l14 (ViCLIP), dino_b14/dino_l14 (DINOv2)")
     parser.add_argument("-FRAMES", type=int, default=1,
@@ -97,15 +97,15 @@ def parse_args():
     parser.add_argument("-HEIGHT", type=int, default=480,
                         help="Input height")
 
-    parser.add_argument("-W_BBOX", type=float, default=5.0,
+    parser.add_argument("-W_BBOX", type=float, default=2.0,
                         help="Weight for bbox L1 loss")
     parser.add_argument("-W_GIOU", type=float, default=2.0,
                         help="Weight for bbox GIoU loss")
     parser.add_argument("-W_HUMAN", type=float, default=2.0,
                         help="Weight for human classification loss")
-    parser.add_argument("-W_KP", type=float, default=3.0,
+    parser.add_argument("-W_KP", type=float, default=5.0,
                         help="Weight for keypoint RLE loss")
-    parser.add_argument("-W_KP_VIS", type=float, default=1.0,
+    parser.add_argument("-W_KP_VIS", type=float, default=2.0,
                         help="Weight for keypoint visibility loss")
     parser.add_argument("-COST_KP", type=float, default=1.0,
                         help="Keypoint cost in Hungarian matching")
@@ -272,7 +272,17 @@ def build_model(args, rank):
             max_roi_cap=args.MAX_ROI_CAP,
             roi_output_size=args.ROI_SIZE,
         )['sia']
-  
+    elif args.MODEL == 'sia_pose_eomt':
+        # EOMT: pretrained ViT split into Stage 1 (patches) + Stage 2 (patches + pose tokens)
+        model = get_sia_pose_eomt(
+            size=size,
+            pretrain=pretrain,
+            pose_token_num=args.DET,
+            num_frames=args.FRAMES,
+            num_keypoints=17,
+            stage2_layers=args.POSE_LAYERS,
+        )['sia']
+
     else:
         raise ValueError(f"Unknown model type: {args.MODEL}")
 
@@ -311,10 +321,9 @@ def build_criterion(args, rank):
         weight_dict[f'loss_keypoint_vis_{i}'] = args.W_KP_VIS
 
     # Heatmap model uses global heatmap loss instead of per-instance RLE loss
-    if args.MODEL == 'sia_pose_heatmap':
-        losses_list = ['keypoints_heatmap', 'boxes', 'human']
-    else:
-        losses_list = ['keypoints', 'boxes', 'human']
+ 
+    # Main loss computation
+    losses_list = ['keypoints', 'boxes', 'human']
 
     num_kp = 15 if args.MODEL == 'sia_pose_posetrack' else 17
 
@@ -346,6 +355,8 @@ def freeze_encoder(model):
             'pose_decoder_module', 'pose_decoder_ln',                      # lightweight pose decoder
             'roi_refine_layers', 'roi_refine_ln',                          # ROI refinement
             'roi_pos_embed',                                               # ROI positional embedding
+            'det_proj', 'pose_proj',                                       # Token splitting projections
+            'stage2_encoder', 'pose_token', 'pose_positional_embedding',   # EOMT model
         ]):
             param.requires_grad = True
             trainable_count += param.numel()
@@ -431,7 +442,9 @@ def build_optimizer(model, args, criterion=None):
                     'heatmap_decoder' in name or
                     'pose_decoder_module' in name or 'pose_decoder_ln' in name or
                     'roi_refine_layers' in name or 'roi_refine_ln' in name or
-                    'roi_pos_embed' in name):
+                    'roi_pos_embed' in name or
+                    'det_proj' in name or 'pose_proj' in name or
+                    'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
@@ -527,6 +540,19 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
         total_loss += loss_value
         num_batches += 1
 
+        # Compute grouped DET and POSE losses for logging
+        with torch.no_grad():
+            det_loss = sum(
+                loss_dict[k].item() * weight_dict[k]
+                for k in ('loss_bbox', 'loss_giou', 'loss_human')
+                if k in loss_dict and k in weight_dict
+            )
+            pose_loss = sum(
+                loss_dict[k].item() * weight_dict[k]
+                for k in ('loss_keypoints', 'loss_keypoint_vis')
+                if k in loss_dict and k in weight_dict
+            )
+
         # Count detections
         if postprocess is not None:
             with torch.no_grad():
@@ -537,10 +563,7 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
         # Log progress
         if rank == 0:
-            loss_str = f"loss: {loss_value:.3f} | grad_norm: {grad_norm:.4f}"
-            for k, v in loss_dict.items():
-                if k in weight_dict:
-                    loss_str += f" | {k}: {v.item():.3f}"
+            loss_str = f"loss: {loss_value:.3f} | DET: {det_loss:.3f} | POSE: {pose_loss:.3f} | grad_norm: {grad_norm:.4f}"
 
             # tqdm updates automatically with postfix set below
 
@@ -549,6 +572,8 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                 global_step = epoch * num_total_batches + batch_idx
                 wandb_metrics = {
                     'train/loss': loss_value,
+                    'train/det_loss': det_loss,
+                    'train/pose_loss': pose_loss,
                     'train/grad_norm': grad_norm,
                     'train/epoch': epoch + (batch_idx + 1) / num_total_batches,
                     'train/total_detections': total_train_det,
@@ -569,7 +594,7 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
             # Log detailed losses to console every LOG steps
             if (batch_idx + 1) % log_freq == 0 or batch_idx == 0:
                 log_msg = f"Epoch {epoch} [{batch_idx + 1}/{num_total_batches}] "
-                log_msg += f"loss: {loss_value:.4f} | grad_norm: {grad_norm:.4f}"
+                log_msg += f"loss: {loss_value:.4f} | DET: {det_loss:.4f} | POSE: {pose_loss:.4f} | grad_norm: {grad_norm:.4f}"
                 for k, v in loss_dict.items():
                     if k in weight_dict:
                         log_msg += f" | {k}: {v.item():.4f}"

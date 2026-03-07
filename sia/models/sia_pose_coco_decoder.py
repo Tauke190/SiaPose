@@ -15,59 +15,57 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Model Architecture: SIA Pose Decoder
+# Model Architecture: SIA Pose Decoder (with Token Splitting)
 # ============================================================================
 #
 #  Input: Video [B, T, C, H, W]
 #    ↓
 #  Vision Encoder (ViT-B/L with temporal processing)
-#    │ Conv1 → Spatial patches [B, HW, D]
+#    │ Conv1 → Spatial patches [B, HWT, D]
 #    │ Temporal embedding across frames
-#    │ Unified Query Tokens [B, N, D] (shared for detection+pose)
+#    │ Unified Query Tokens [B, N, D] (processed jointly with patches)
 #    ↓
 #  ┌─────────────────────────────────────────────────────────────┐
 #  │ Transformer Backbone (12 or 24 layers)                      │
-#  │ Output: Spatial Features [B, HWT, D] + Query Tokens [B, N, D]
+#  │ Self-attention over [spatial patches + query tokens]        │
+#  │ Output: spatial_features [B, HWT, D]                       │
+#  │         query_x          [B, N, D]                         │
 #  └─────────────────────────────────────────────────────────────┘
 #    │
-#    ├─→ DETECTION BRANCH
-#    │     Query Tokens [B, N, D]
-#    │       ↓ det_head_class
-#    │       pred_logits [B, N, C]
-#    │       ↓ det_head_bbox
-#    │       pred_boxes [B, N, 4] (cx, cy, w, h)
-#    │       ↓ det_head_human
+#    │  TOKEN ROUTING (post-encoder, detached bboxes)
+#    │  query_x [B, N, D]
+#    │       ├ (direct use)
+#    ├──→ det_x [B, N, D]   ← detection: use query tokens directly
+#    │       └ pose_proj (Linear D→4D → GELU → Linear 4D→D)
+#    └──→ pose_x [B, N, D]  ← pose: specialized features via projection
+#    │
+#    │  Gradients: encoder   ← both losses (shared, benefits from both tasks)
+#    │             pose_proj ← keypoint losses only
+#    │
+#    ├─→ DETECTION BRANCH (det_x)
+#    │       ↓ det_head_bbox  (MLP → sigmoid)
+#    │       pred_boxes [B, N, 4]  (cx, cy, w, h) normalized
+#    │       ↓ det_head_human (MLP)
 #    │       human_logits [B, N, 2]
 #    │
-#    └─→ POSE DECODER BRANCH (Deep Supervision)
-#          Query Tokens [B, N, D]
-#            ↓
-#          Decoder Layer 1: Self-Attn + Cross-Attn to Spatial Features + FFN
-#            ↓ [aux_output_0]
-#          Decoder Layer 2: Self-Attn + Cross-Attn to Spatial Features + FFN
-#            ↓ [aux_output_1]
-#          Decoder Layer 3: Self-Attn + Cross-Attn to Spatial Features + FFN
+#    └─→ POSE DECODER BRANCH (pose_x)
+#          pose_x [B, N, D]
+#            ↓ (×decoder_layers) Self-Attn + Cross-Attn(spatial_features) + FFN
 #            ↓ LayerNorm
-#          Refined Query Tokens [B, N, D]
+#          refined pose_x [B, N, D]
+#            ↓ keypoint_proj (MLP D → K×D, reshape to [B, N, K, D])
+#          per-keypoint features [B, N, K, D]
+#            ├─→ keypoint_xy_head  (MLP → tanh)  → bbox-relative offsets [-1,1]
+#            │     → convert to absolute: kp = bbox_center + offset × bbox_size
+#            └─→ keypoint_vis_head (MLP → sigmoid) → visibility [0,1]
 #            ↓
-#          KEYPOINT HEAD (per detection, per keypoint)
-#            │ Learnable keypoint embeddings [K, D]
-#            │ Condition on parent detection features
-#            ↓
-#          Keypoint XY head (MLP): D → 2
-#          Keypoint Visibility head (MLP): D → 1
-#            ↓
-#          Output: pred_keypoints [B, N, K, 3]
+#          pred_keypoints [B, N, K, 3]  (x, y, visibility)
 #
 #  TOTAL OUTPUTS:
 #  {
-#    'pred_boxes': [B, N, 4],
-#    'pred_logits': [B, N, C],
-#    'human_logits': [B, N, 2],
+#    'pred_boxes':     [B, N, 4],
+#    'human_logits':   [B, N, 2],
 #    'pred_keypoints': [B, N, 17, 3],
-#    'aux_outputs': [
-#      {'pred_boxes', 'pred_logits', 'human_logits', 'pred_keypoints'} × (decoder_layers-1)
-#    ]
 #  }
 #
 # ============================================================================
@@ -80,18 +78,18 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
 
     Architecture breakdown:
     1. Vision Encoder: ViT processes [patches + query_tokens]
-    2. Detection Head: query_tokens → bbox and human score predictions
-    3. Pose Decoder: query_tokens refined via cross-attention to spatial features
+    2. Detection Head: query_tokens → detection token -> bbox and human score predictions
+    3. Pose Decoder: query_tokens -> pose_tokens refined via cross-attention to spatial features
     4. Keypoint Head: pose-refined query_tokens → keypoint coordinates and visibility
 
-    Single query token set ensures perfect alignment between detections and pose predictions.
+    Single query token set ensures perfect alignment between detections and pose predictions that share positional embeddings
     """
     
     def __init__(self,
                  size='l',
                  pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
-                 det_token_num=100,
-                 num_frames=1,
+                 det_token_num=20,
+                 num_frames=9,
                  num_keypoints=17,
                  decoder_layers=3):
         super(SIA_POSE_SIMPLE_DEC, self).__init__()
@@ -138,9 +136,10 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
                 self.size.upper(), self.patch_size, self.layers, self.heads, self.width) +
             "    ↓\n" +
             "  [Spatial Patches] + [Query Tokens={:d}] (unified for detection+pose)\n".format(det_token_num) +
-            "    ├─→ Detection Head (bboxes, human scores, class logits)\n" +
+            "    ├─→ Detection token -> Detection Head (bboxes, human scores)\n" +
+            "    |--> Query tokens"
             "    └─→ Pose Decoder ({:d} layers, cross-attn to spatial patches)\n".format(decoder_layers) +
-            "         ├─→ Self-Attention among query tokens\n" +
+            "         ├─→ Self-Attention among pose tokens tokens\n" +
             "         ├─→ Cross-Attention to spatial patches\n" +
             "         └─→ Keypoint Head ({:d} keypoints XY + visibility)\n".format(num_keypoints) +
             "  Output: pred_boxes, human_logits, pred_keypoints [B, N, K, 3]")
@@ -169,7 +168,6 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
         # ================================================================
         # Single set of query tokens predicts both boxes and keypoints.
         # This eliminates alignment issues: token[i] → box[i] + keypoints[i]
-        # No separate pose tokens — the pose decoder receives det_x directly.
         self.query_token_num = det_token_num
         
         # ================================================================
@@ -187,15 +185,31 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
         self.pose_decoder_ln = nn.LayerNorm(self.width)
 
         # ================================================================
-        # Module 4: Detection Heads (for bounding boxes)
+        # Module 4: Pose Specialization Projection (post-encoder)
+        # ================================================================
+        # Only the pose branch needs specialization via cross-attention.
+        # Detection tokens already encode bbox information in the encoder,
+        # so no additional projection is needed there.
+        #
+        #   query_x [B, N, D]
+        #       ├── (direct)   → det_x = query_x → Detection Heads (bbox, human)
+        #       └── pose_proj  → pose_x → Pose Decoder → Keypoint Heads
+        #
+        self.pose_proj = nn.Sequential(
+            nn.Linear(self.width, self.width * 4),
+            nn.GELU(),
+            nn.Linear(self.width * 4, self.width),
+        )
+
+        # ================================================================
+        # Module 5: Detection Heads (for bounding boxes)
         # ================================================================
         # These are inherited from vision_encoder, but we reference them explicitly
         self.det_head_human = self.vision_encoder.human_embed  # [det_tokens] → human scores
         self.det_head_bbox = self.vision_encoder.bbox_embed    # [det_tokens] → bboxes
-        self.det_head_class = self.vision_encoder.proj         # [det_tokens] → class logits
 
         # ================================================================
-        # Module 5: Keypoint Heads (for pose estimation)
+        # Module 6: Keypoint Heads (for pose estimation)
         # ================================================================
         # Use 2-layer MLP to project pose features to per-keypoint embeddings
         # This creates expressive, nonlinear per-keypoint features instead of simple additive embeddings
@@ -216,7 +230,6 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
             state_dict = torch.load(pretrain, map_location='cpu', weights_only=False)['model']
             state_dict = interpolate_pos_embed_vit(state_dict, self.vision_encoder)
             self.vision_encoder.load_state_dict(state_dict, strict=False)
-
 
     def no_weight_decay(self):
         """Return parameter names that should not have weight decay applied."""
@@ -259,19 +272,19 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
         outputs = {}
 
         # ================================================================
-        # DETECTION HEAD STAGE: Predict bounding boxes and classes from query tokens
+        # TASK-SPECIFIC ROUTING: Split query tokens for detection and pose
         # ================================================================
-        # Detection logits
-        if self.det_head_class is not None:
-            class_logits = query_x @ self.det_head_class
-        else:
-            class_logits = query_x
+        det_x = query_x                   # [B, N, D] — use directly for detection
+        pose_x = self.pose_proj(query_x)  # [B, N, D] — specialize for pose refinement
 
+        # ================================================================
+        # DETECTION HEAD STAGE: Predict bounding boxes and human scores
+        # ================================================================
         # Bounding boxes
-        bboxes = self.det_head_bbox(query_x).sigmoid()  # [B, query_num, 4]
+        bboxes = self.det_head_bbox(det_x).sigmoid()  # [B, query_num, 4]
 
         # Human scores
-        human_scores = self.det_head_human(query_x)     # [B, query_num, 2]
+        human_scores = self.det_head_human(det_x)     # [B, query_num, 2]
 
         # Diagnostic: log prediction statistics
         if self.training and B == 1:  # Only log for first batch in training
@@ -282,7 +295,6 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
                 logger.debug(f"[Batch {B}] bboxes: mean={bbox_mean:.4f}, std={bbox_std:.4f} | "
                            f"human_scores: max={human_scores_max:.4f}")
 
-        outputs['pred_logits'] = class_logits
         outputs['pred_boxes'] = bboxes
         outputs['human_logits'] = human_scores
 
@@ -292,7 +304,7 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
         # Collect intermediate outputs for auxiliary losses
         # ================================================================
         aux_pose_outputs = []
-        pose_x = query_x  # Start with query tokens
+        # pose_x already projected above via pose_proj
         for decoder_layer in self.pose_decoder:
             pose_x = decoder_layer(pose_x, spatial_features)  # Self-attn + cross-attn + FFN
             aux_pose_outputs.append(pose_x)
@@ -317,26 +329,20 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
         outputs['pred_keypoints'] = pred_keypoints
 
         # ================================================================
-        # AUXILIARY LOSSES: Add outputs from intermediate decoder layers
+        # AUXILIARY LOSSES: Commented out — only final decoder layer supervised
         # ================================================================
-        aux_outputs = []
-        for aux_pose_x in aux_pose_outputs[:-1]:  # Skip last layer (already in main output)
-            aux_pose_x = self.pose_decoder_ln(aux_pose_x)
-
-            # Extract auxiliary keypoints with bboxes anchor
-            aux_pred_keypoints = self._extract_keypoints(aux_pose_x, bboxes, B)
-
-            # Create auxiliary output dict with same structure as main output
-            aux_dict = {
-                'pred_logits': outputs['pred_logits'],  # Reuse detection logits
-                'pred_boxes': outputs['pred_boxes'],    # Reuse detection boxes
-                'human_logits': outputs['human_logits'],  # Reuse human logits
-                'pred_keypoints': aux_pred_keypoints,   # Different keypoints from intermediate layer
-            }
-            aux_outputs.append(aux_dict)
-
-        if aux_outputs:
-            outputs['aux_outputs'] = aux_outputs
+        # aux_outputs = []
+        # for aux_pose_x in aux_pose_outputs[:-1]:  # Skip last layer (already in main output)
+        #     aux_pose_x = self.pose_decoder_ln(aux_pose_x)
+        #     aux_pred_keypoints = self._extract_keypoints(aux_pose_x, bboxes, B)
+        #     aux_dict = {
+        #         'pred_boxes': outputs['pred_boxes'],
+        #         'human_logits': outputs['human_logits'],
+        #         'pred_keypoints': aux_pred_keypoints,
+        #     }
+        #     aux_outputs.append(aux_dict)
+        # if aux_outputs:
+        #     outputs['aux_outputs'] = aux_outputs
 
         return outputs
 
@@ -387,12 +393,11 @@ class SIA_POSE_SIMPLE_DEC(nn.Module):
         # kp = bbox_center + offset * bbox_size, where offset ∈ [-1, 1]
         bbox_center = bboxes[:, :, :2].unsqueeze(2)  # [B, N, 1, 2] (cx, cy)
         bbox_size = bboxes[:, :, 2:].unsqueeze(2)    # [B, N, 1, 2] (w, h)
-        keypoints_xy = (bbox_center + keypoints_offset * bbox_size).clamp(0, 1)
+        keypoints_xy = (bbox_center.detach() + keypoints_offset * bbox_size.detach()).clamp(0, 1)
 
         pred_keypoints = torch.cat([keypoints_xy, keypoints_vis], dim=-1)
 
         return pred_keypoints
-
 
     def _forward_encoder(self, video, masking_prob=0.0):
         """
