@@ -143,12 +143,28 @@ class Transformer(nn.Module):
                                                          det_token_num=det_token_num))
         self.checkpoint_num = checkpoint_num
 
-    def forward(self, x):
+    def forward(self, x, return_layers=None):
+        """
+        Args:
+            x: [N, B, D] input tensor (NBD format)
+            return_layers: optional set/list of int layer indices whose
+                           post-block outputs should be captured and returned.
+                           Default None → returns x (unchanged behaviour).
+
+        Returns:
+            If return_layers is None:  x  (Tensor, same as before)
+            Else: (x, intermediates)  where intermediates is dict[int -> Tensor]
+        """
+        intermediates = {} if return_layers is not None else None
         for idx, blk in enumerate(self.resblocks):
             if idx < self.checkpoint_num:
                 x = checkpoint.checkpoint(blk, x, use_reentrant=False)
             else:
                 x = blk(x)
+            if return_layers is not None and idx in return_layers:
+                intermediates[idx] = x  # NBD format, no detach — gradients flow through
+        if return_layers is not None:
+            return x, intermediates
         return x
 
 class VisionTransformer(nn.Module):

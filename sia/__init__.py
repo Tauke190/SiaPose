@@ -82,7 +82,6 @@ def get_sia_pose_coco_roi(size='l',
                         num_frames=1,
                         num_keypoints=17,
                         decoder_layers=3,
-                        max_roi_cap=0,
                         roi_output_size=14):
     """
     Get SIA pose model with ROI-based pose decoder.
@@ -91,7 +90,6 @@ def get_sia_pose_coco_roi(size='l',
     Pose queries cross-attend only to ROI spatial features.
 
     Args:
-        max_roi_cap: legacy, unused when roi_output_size > 0.
         roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
                          14 = 196 tokens per detection. 0 = fallback to variable-length.
     """
@@ -102,7 +100,6 @@ def get_sia_pose_coco_roi(size='l',
         num_frames=num_frames,
         num_keypoints=num_keypoints,
         decoder_layers=decoder_layers,
-        max_roi_cap=max_roi_cap,
         roi_output_size=roi_output_size,
     )
     m = {'sia': sia_model}
@@ -114,8 +111,8 @@ def get_sia_pose_coco_roi_best(size='l',
                         num_frames=1,
                         num_keypoints=17,
                         decoder_layers=3,
-                        max_roi_cap=0,
-                        roi_output_size=14):
+                        roi_output_size=14,
+                        fusion_layers=None):
     """
     Get SIA pose model with optimized ROI-based pose decoder (SIA_POSE_SIMPLE_DEC_ROI_BEST).
 
@@ -129,9 +126,11 @@ def get_sia_pose_coco_roi_best(size='l',
     Pose queries cross-attend only to ROI spatial features extracted via roi_align.
 
     Args:
-        max_roi_cap: legacy, unused when roi_output_size > 0.
         roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
                          14 = 196 tokens per detection. 0 = fallback to variable-length.
+        fusion_layers: list of ViT block indices to fuse with final-layer features.
+                       E.g. [6,8,10] for ViT-B/16 or [12,16,20] for ViT-L/24.
+                       Default None = no fusion (baseline behaviour).
     """
     sia_model = SIA_POSE_SIMPLE_DEC_ROI_BEST(
         size=size,
@@ -140,8 +139,8 @@ def get_sia_pose_coco_roi_best(size='l',
         num_frames=num_frames,
         num_keypoints=num_keypoints,
         decoder_layers=decoder_layers,
-        max_roi_cap=max_roi_cap,
         roi_output_size=roi_output_size,
+        fusion_layers=fusion_layers,
     )
     m = {'sia': sia_model}
     return m
@@ -152,7 +151,6 @@ def get_sia_pose_posetrack(size='l',
                                 num_frames=9,
                                 num_keypoints=15,
                                 decoder_layers=3,
-                                max_roi_cap=0,
                                 roi_output_size=14):
     """
     Get SIA pose model with ROI-based pose decoder.
@@ -161,7 +159,6 @@ def get_sia_pose_posetrack(size='l',
     Pose queries cross-attend only to ROI spatial features.
 
     Args:
-        max_roi_cap: legacy, unused when roi_output_size > 0.
         roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
                          14 = 196 tokens per detection. 0 = fallback to variable-length.
     """
@@ -172,7 +169,6 @@ def get_sia_pose_posetrack(size='l',
         num_frames=num_frames,
         num_keypoints=num_keypoints,
         decoder_layers=decoder_layers,
-        max_roi_cap=max_roi_cap,
         roi_output_size=roi_output_size,
     )
     m = {'sia': sia_model}

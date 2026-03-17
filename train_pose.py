@@ -58,10 +58,11 @@ def parse_args():
                         help="Number of detection tokens")
     parser.add_argument("-POSE_LAYERS", type=int, default=3,
                         help="Number of pose decoder layers")
-    parser.add_argument("-MAX_ROI_CAP", type=int, default=0,
-                        help="(Legacy) Cap max ROI size. Unused when -ROI_SIZE > 0")
     parser.add_argument("-ROI_SIZE", type=int, default=14,
                         help="ROI output size P (each ROI -> PxP tokens via roi_align). 14=196 tokens, 7=49 tokens. 0=fallback to variable-length")
+    parser.add_argument("-FUSION_LAYERS", type=str, default="",
+                        help="Comma-separated ViT block indices to fuse with final-layer features before ROI extraction. "
+                             "E.g. '6,8,10' for ViT-B/16 or '12,16,20' for ViT-L/24. Default '' = no fusion.")
     parser.add_argument("--FREEZE_BACKBONE", action="store_true",
                         help="Freeze vision encoder, train only pose heads (use with pretrained weights)")
 
@@ -72,7 +73,7 @@ def parse_args():
                         help="Path to train keypoints annotation JSON. Default for COCO: ROOT/annotations/person_keypoints_train2017.json. Required for PoseTrack.")
     parser.add_argument("-VAL_ANN", type=str, default=None,
                         help="Path to val keypoints annotation JSON. Default for COCO: ROOT/annotations/person_keypoints_val2017.json. Required for PoseTrack.")
-    parser.add_argument("-MIN_KP", type=int, default=5,
+    parser.add_argument("-MIN_KP", type=int, default=1,
                         help="Minimum visible keypoints per person")
 
     # Training
@@ -88,7 +89,7 @@ def parse_args():
                         help="Learning rate for backbone (lower than decoder)")
     parser.add_argument("-WEIGHT_DECAY", type=float, default=1e-4,
                         help="Weight decay")
-    parser.add_argument("-GRAD_CLIP", type=float, default=1.0,
+    parser.add_argument("-GRAD_CLIP", type=float, default=0,
                         help="Gradient clipping max norm (0 = disabled). Reduced to 1.0 for stable training with unified tokens.")
 
     # Input size
@@ -143,6 +144,12 @@ def parse_args():
                         help="W&B entity/team name")
 
     args = parser.parse_args()
+
+    # Parse fusion layers from comma-separated string
+    args.fusion_layers_list = (
+        [int(x.strip()) for x in args.FUSION_LAYERS.split(',')]
+        if args.FUSION_LAYERS.strip() else []
+    )
 
     # Set default annotation paths (COCO structure only)
     # PoseTrack users must provide explicit -TRAIN_ANN and -VAL_ANN
@@ -245,7 +252,6 @@ def build_model(args, rank):
             num_frames=args.FRAMES,
             num_keypoints=17,
             decoder_layers=args.POSE_LAYERS,
-            max_roi_cap=args.MAX_ROI_CAP,
             roi_output_size=args.ROI_SIZE,
         )['sia']
     elif args.MODEL == 'sia_pose_coco_roi_best':
@@ -257,8 +263,8 @@ def build_model(args, rank):
             num_frames=args.FRAMES,
             num_keypoints=17,
             decoder_layers=args.POSE_LAYERS,
-            max_roi_cap=args.MAX_ROI_CAP,
             roi_output_size=args.ROI_SIZE,
+            fusion_layers=args.fusion_layers_list,
         )['sia']
     elif args.MODEL == 'sia_pose_posetrack':
         # ROI-based decoder: pose queries cross-attend only to ROI features
@@ -269,7 +275,6 @@ def build_model(args, rank):
             num_frames=args.FRAMES,
             num_keypoints=15,
             decoder_layers=args.POSE_LAYERS,
-            max_roi_cap=args.MAX_ROI_CAP,
             roi_output_size=args.ROI_SIZE,
         )['sia']
     elif args.MODEL == 'sia_pose_eomt':
@@ -357,6 +362,7 @@ def freeze_encoder(model):
             'roi_pos_embed',                                               # ROI positional embedding
             'det_proj', 'pose_proj',                                       # Token splitting projections
             'stage2_encoder', 'pose_token', 'pose_positional_embedding',   # EOMT model
+            'fusion_weights', 'fusion_layer_norms',                        # multi-layer feature fusion
         ]):
             param.requires_grad = True
             trainable_count += param.numel()
@@ -444,7 +450,8 @@ def build_optimizer(model, args, criterion=None):
                     'roi_refine_layers' in name or 'roi_refine_ln' in name or
                     'roi_pos_embed' in name or
                     'det_proj' in name or 'pose_proj' in name or
-                    'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name):
+                    'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name or
+                    'fusion_weights' in name or 'fusion_layer_norms' in name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)

@@ -213,6 +213,7 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         temp_embed=True, det_token_num=100,
         num_keypoints=17, decoder_layers=3, max_roi_cap=0,
         roi_output_size=14,
+        fusion_layers=None,
     ):
         # Parent encoder with NO pose handling
         super().__init__(
@@ -252,6 +253,27 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             )
             nn.init.normal_(self.roi_pos_embed, std=0.02)
 
+        # Multi-layer feature fusion
+        # fusion_layers: list of ViT block indices whose outputs are fused with
+        # the final-layer spatial features before ROI extraction.
+        # When empty, the forward pass is identical to the original code.
+        self.fusion_layers = list(fusion_layers) if fusion_layers else []
+        if self.fusion_layers:
+            for li in self.fusion_layers:
+                assert 0 <= li < layers, \
+                    f"fusion_layers index {li} out of range [0, {layers})"
+            num_fused = len(self.fusion_layers)
+            # Separate LayerNorm per intermediate: intermediate activations have
+            # different scale/shift than ln_post-normalised final features.
+            self.fusion_layer_norms = nn.ModuleList([
+                nn.LayerNorm(width) for _ in range(num_fused)
+            ])
+            # Learned scalar weights: [num_fused + 1], last slot = final layer.
+            # Init biased toward final layer so the model starts near baseline.
+            fusion_init = torch.zeros(num_fused + 1)
+            fusion_init[-1] = 2.0
+            self.fusion_weights = nn.Parameter(fusion_init)
+
         # ROI pose decoder: self-attn + cross-attn(ROI) + FFN per layer
         self.pose_decoder_module = nn.ModuleList([
             ROIPoseDecoderLayer(
@@ -264,15 +286,12 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         ])
         self.pose_decoder_ln = nn.LayerNorm(width)
 
-        # Keypoint heads
-        # Use 2-layer MLP instead of single linear layer for better expressiveness
-        self.keypoint_proj = nn.Sequential(
-            nn.Linear(width, width * 4),
-            nn.GELU(),
-            nn.Linear(width * 4, num_keypoints * width),
-        )
-        self.simple_keypoint_xy_head = MLP(width, width, 2, 3)
-        self.simple_keypoint_vis_head = MLP(width, width // 2, 1, 2)
+        # Keypoint heads: bottleneck projection (256× smaller than before)
+        # Projects decoder output [B, N, D] → [B, N, 17*256]
+        # Then simple linear: [B*N*17, 256] → [B*N*17, 3]
+        self.kp_hidden_dim = 256
+        self.keypoint_proj = nn.Linear(width, num_keypoints * self.kp_hidden_dim)
+        self.keypoint_head = nn.Linear(self.kp_hidden_dim, 3)  # predicts (x, y, vis)
 
     def forward(self, x, masking_prob=0.0):
         """Forward pass with ROI-based pose decoding."""
@@ -318,7 +337,13 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # BND -> NBD
-        x = self.transformer(x)
+
+        if self.fusion_layers:
+            x, intermediates = self.transformer(x, return_layers=set(self.fusion_layers))
+        else:
+            x = self.transformer(x)
+            intermediates = None
+
         x = self.ln_post(x)
 
         # Split spatial features and det tokens
@@ -328,6 +353,23 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         else:
             spatial_features = x.permute(1, 0, 2)
             det_x = self.dropout(x.reshape(H*W, T, B, C).mean(1)).permute(1, 0, 2)
+
+        # Multi-layer feature fusion: weighted sum of intermediate + final spatial features
+        if intermediates is not None:
+            fused_list = []
+            for i, layer_idx in enumerate(self.fusion_layers):
+                # Extract spatial tokens from NBD format (exclude det_tokens at end)
+                if self.det_token_num > 0:
+                    inter_sp = intermediates[layer_idx][:-self.det_token_num].permute(1, 0, 2)
+                else:
+                    inter_sp = intermediates[layer_idx].permute(1, 0, 2)
+                inter_sp = self.fusion_layer_norms[i](inter_sp)
+                fused_list.append(inter_sp)
+            fused_list.append(spatial_features)  # final layer (already ln_post normalized)
+
+            w = torch.softmax(self.fusion_weights, dim=0)          # [num_fused+1]
+            stacked = torch.stack(fused_list, dim=0)               # [num_fused+1, B, H*W*T, D]
+            spatial_features = (w.view(-1, 1, 1, 1) * stacked).sum(0)  # [B, H*W*T, D]
 
         # --- Detection heads ---
         if self.proj is not None:
@@ -398,12 +440,19 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
     def _predict_keypoints(self, pose_x, bboxes):
         """Predict keypoints as bbox-relative offsets, then convert to global coords."""
         B_kp, num_det, D = pose_x.shape
-        kp_features = self.keypoint_proj(pose_x)  # [B, N, 17*D]
-        kp_features = kp_features.reshape(B_kp, num_det, self.num_keypoints, D)
 
-        kp_flat = kp_features.reshape(B_kp * num_det * self.num_keypoints, D)
-        keypoints_offset = self.simple_keypoint_xy_head(kp_flat).tanh()  # [-1, 1] relative offsets
-        keypoints_vis = self.simple_keypoint_vis_head(kp_flat).sigmoid()
+        # Project to per-keypoint hidden features: [B, N, D] → [B, N, 17*256]
+        kp_proj = self.keypoint_proj(pose_x)  # [B, N, 17*kp_hidden_dim]
+        kp_features = kp_proj.reshape(B_kp, num_det, self.num_keypoints, self.kp_hidden_dim)
+
+        # Flatten and predict (x, y, vis) for each keypoint
+        kp_flat = kp_features.reshape(B_kp * num_det * self.num_keypoints, self.kp_hidden_dim)
+        kp_out = self.keypoint_head(kp_flat)  # [B*N*17, 3]
+        kp_out = kp_out.reshape(B_kp, num_det, self.num_keypoints, 3)
+
+        # Split into xy (offsets) and visibility
+        keypoints_offset = kp_out[..., :2].tanh()  # [-1, 1] relative offsets
+        keypoints_vis = kp_out[..., 2:3].sigmoid()
 
         keypoints_offset = keypoints_offset.reshape(B_kp, num_det, self.num_keypoints, 2)
         keypoints_vis = keypoints_vis.reshape(B_kp, num_det, self.num_keypoints, 1)
@@ -425,7 +474,7 @@ def clip_joint_b16_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
-    roi_output_size=14,
+    roi_output_size=14, fusion_layers=None,
 ):
     """ViT-B/16 with ROI pose decoder."""
     model = VisionTransformerSimpleDecoderROI(
@@ -437,6 +486,7 @@ def clip_joint_b16_simple_dec_roi(
         num_keypoints=num_keypoints, decoder_layers=decoder_layers,
         max_roi_cap=max_roi_cap,
         roi_output_size=roi_output_size,
+        fusion_layers=fusion_layers,
     )
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-B/16"
@@ -450,7 +500,7 @@ def clip_joint_l14_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=20,
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
-    roi_output_size=14,
+    roi_output_size=14, fusion_layers=None,
 ):
     """ViT-L/14 with ROI pose decoder."""
     model = VisionTransformerSimpleDecoderROI(
@@ -462,6 +512,7 @@ def clip_joint_l14_simple_dec_roi(
         num_keypoints=num_keypoints, decoder_layers=decoder_layers,
         max_roi_cap=max_roi_cap,
         roi_output_size=roi_output_size,
+        fusion_layers=fusion_layers,
     )
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-L/14"
@@ -539,7 +590,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                  num_keypoints=17,
                  decoder_layers=3,
                  max_roi_cap=0,
-                 roi_output_size=14):
+                 roi_output_size=14,
+                 fusion_layers=None):
         super(SIA_POSE_SIMPLE_DEC_ROI_BEST, self).__init__()
 
         if size.lower() == 'l':
@@ -566,6 +618,7 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
         self.decoder_layers = decoder_layers
         self.max_roi_cap = max_roi_cap
         self.roi_output_size = roi_output_size
+        self.fusion_layers = list(fusion_layers) if fusion_layers else []
         self._last_roi_stats = {}  # Initialize for logging
 
         if self.det_token_num > 0:
@@ -575,6 +628,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
 
         roi_info = f'roi_align {roi_output_size}x{roi_output_size}={roi_output_size**2} tokens' if roi_output_size > 0 else f'variable-len (cap={max_roi_cap})'
         print(f'Dec-ROI pose: {num_keypoints} keypoints, {decoder_layers} decoder layers, {roi_info}')
+        if self.fusion_layers:
+            print(f'Feature fusion layers: {self.fusion_layers}')
 
         # Build vision encoder
         self.vision_encoder = self.build_vision_encoder()
@@ -636,6 +691,7 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                 decoder_layers=self.decoder_layers,
                 max_roi_cap=self.max_roi_cap,
                 roi_output_size=self.roi_output_size,
+                fusion_layers=self.fusion_layers,
             )
         elif encoder_name == "vit_b16":
             vision_encoder = clip_joint_b16_simple_dec_roi(
@@ -651,6 +707,7 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                 decoder_layers=self.decoder_layers,
                 max_roi_cap=self.max_roi_cap,
                 roi_output_size=self.roi_output_size,
+                fusion_layers=self.fusion_layers,
             )
         else:
             raise NotImplementedError(f"Not implemented: {encoder_name}")

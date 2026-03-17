@@ -180,6 +180,8 @@ class COCOPose(Dataset):
 
         # Load image
         img_path = os.path.join(self.root, img_info['file_name'])
+        # Handle misconfigured paths with extra 'images/' directory
+        img_path = img_path.replace('/images/', '/')
         img = Image.open(img_path).convert('RGB')
         img_w, img_h = img.size
 
