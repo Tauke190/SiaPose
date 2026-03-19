@@ -220,6 +220,7 @@ def build_model(args):
             num_frames=args.num_frames,
             num_keypoints=17,
             decoder_layers=args.pose_layers,
+            fusion_layers=args.fusion_layers_list,
         )['sia']
     else:
         raise ValueError(f"Unknown model: {args.model}. Supported: sia_pose_simple_dec, sia_pose_coco_roi, sia_pose_coco_roi_best")
@@ -300,6 +301,8 @@ def parse_args():
                    help='Number of detection tokens')
     p.add_argument('--pose_layers', type=int, default=3,
                    help='Number of pose decoder layers')
+    p.add_argument('--fusion_layers', type=str, default='',
+                   help='Comma-separated ViT block indices to fuse with final-layer features (e.g. "6,8,10" for ViT-B/16). Default "" = no fusion.')
     p.add_argument('--num_frames', type=int, default=1,
                    help='Number of input frames (image duplicated)')
 
@@ -334,8 +337,15 @@ def parse_args():
     p.add_argument('--output_dir', type=str, default=None,
                    help='Directory to save results JSON and metrics')
 
-
-    return p.parse_args()
+    args = p.parse_args()
+    
+    # Parse fusion layers from comma-separated string
+    args.fusion_layers_list = (
+        [int(x.strip()) for x in args.fusion_layers.split(',')]
+        if args.fusion_layers.strip() else []
+    )
+    
+    return args
 
 
 def main():
