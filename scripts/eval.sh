@@ -7,7 +7,7 @@
 # Override defaults with environment variables:
 #   CHECKPOINT=weights/my_model.pt MODEL=sia_pose bash scripts/eval.sh
 
-CHECKPOINT=${CHECKPOINT:-"weights/sia_pose_coco_b16_best.pt"}
+CHECKPOINT=${CHECKPOINT:-"weights/sia_pose_coco_roi_best_b16_best.pt"}
 MODEL=${MODEL:-"sia_pose_coco_roi_best"}
 SIZE=${SIZE:-"b16"}
 DATASET=${DATASET:-"coco"}
@@ -18,7 +18,7 @@ NUM_FRAMES=${NUM_FRAMES:-1}
 POSE_LAYERS=${POSE_LAYERS:-3}
 
 if [ "$DATASET" = "coco" ]; then
-    DATA_ROOT=${COCO_ROOT:-"/mnt/SSD2/coco2017/images"}
+    DATA_ROOT=${COCO_ROOT:-"/mnt/SSD2/coco2017"}
     ANN_FILE=${COCO_ANN_FILE:-"/mnt/SSD2/coco2017/annotations/person_keypoints_val2017.json"}
     OUTPUT_DIR=${OUTPUT_DIR:-"output/lado"}
 elif [ "$DATASET" = "posetrack" ]; then

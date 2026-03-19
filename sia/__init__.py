@@ -114,23 +114,26 @@ def get_sia_pose_coco_roi_best(size='l',
                         roi_output_size=14,
                         fusion_layers=None):
     """
-    Get SIA pose model with optimized ROI-based pose decoder (SIA_POSE_SIMPLE_DEC_ROI_BEST).
+    Get SIA pose model with optimized FPN-style ROI-based pose decoder.
 
     This model uses an optimized ROI decoder variant with:
+    - FPN-style multi-level ROI extraction (when fusion_layers set)
+    - Scale-aware per-detection blending (small bbox -> early ViT layers)
     - Unified query tokens for detection + pose (perfect alignment)
     - Self-attention among pose queries (global context)
     - Cross-attention to per-detection ROI features via roi_align
-    - FlashAttention support (when roi_mask=None)
+    - FlashAttention support (no padding masks)
 
     Detection tokens stay in encoder -> bboxes.
-    Pose queries cross-attend only to ROI spatial features extracted via roi_align.
+    Pose queries cross-attend only to ROI spatial features extracted via FPN routing.
 
     Args:
         roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
                          14 = 196 tokens per detection. 0 = fallback to variable-length.
-        fusion_layers: list of ViT block indices to fuse with final-layer features.
-                       E.g. [6,8,10] for ViT-B/16 or [12,16,20] for ViT-L/24.
-                       Default None = no fusion (baseline behaviour).
+        fusion_layers: list of ViT block indices to capture as FPN intermediate levels.
+                       E.g. [3,6,9] for ViT-B/16 (4 levels: 3,6,9,final)
+                       or [8,16,20] for ViT-L/24 (4 levels: 8,16,20,final)
+                       Default None = no FPN (single roi_align on final features).
     """
     sia_model = SIA_POSE_SIMPLE_DEC_ROI_BEST(
         size=size,
@@ -487,7 +490,7 @@ class SetCriterion(nn.Module):
         # boxes are [cx, cy, w, h] in normalized coords
         target_boxes = torch.cat([t['boxes'][i] for t, (_, i) in zip(targets, indices)], dim=0)
         # Clamp to min 0.05 (5% of image) to avoid extreme gradients for tiny boxes
-        box_wh = target_boxes[:, 2:].clamp(min=0.05)  # [num_matched, 2]
+        box_wh = target_boxes[:, 2:].clamp(min=0.01)  # [num_matched, 2]
 
         # Visibility mask: only compute loss for visible keypoints
         # visibility > 0 means the keypoint is labeled (0=not labeled, 1=occluded, 2=visible)

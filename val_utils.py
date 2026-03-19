@@ -119,6 +119,9 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
     Run validation on a batch of data.
 
     This is the core validation logic shared between train_pose.py and val_pose.py.
+    
+    NOTE: OKS score is calculated ONLY for small+medium sized objects (area < 9216 px²)
+    to focus on pose estimation performance for smaller people.
 
     Args:
         model: The pose estimation model (in eval mode)
@@ -140,7 +143,7 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
           - 'num_images': total number of images processed
           - 'total_gt': total ground-truth persons
           - 'total_det': total detected persons
-          - 'mean_oks': mean OKS over all matched pairs
+          - 'mean_oks': mean OKS over matched pairs (SMALL+MEDIUM objects only, area < 9216)
           - 'val_loss': validation loss (if criterion provided)
           - 'inference_time': total inference time in seconds
     """
@@ -157,6 +160,10 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
     total_oks = 0.0
     num_oks_matched = 0
     total_inference_time = 0.0
+    
+    # Per-component loss tracking (for detailed logging)
+    per_component_losses = {}
+    sigma_stats = {'sigma_min': float('inf'), 'sigma_max': float('-inf'), 'sigma_sum': 0.0, 'sigma_count': 0}
 
     for samples, targets_batch in tqdm(dataloader, desc="Evaluating", file=sys.stderr):
         # Move samples to device
@@ -252,14 +259,17 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
                         )
 
                 # Greedy matching by OKS: preds sorted by score (already sorted from postprocess)
+                # FILTER: Only count OKS for small+medium objects (area < 9216 = 96²)
                 matched_gt = set()
                 for pi in range(num_preds):
                     oks_scores = oks_matrix[pi]
                     order = np.argsort(-oks_scores)
                     for gi in order:
                         if gi not in matched_gt and oks_scores[gi] > 0.0:
-                            total_oks += oks_scores[gi]
-                            num_oks_matched += 1
+                            # Only accumulate OKS if GT is small+medium (area < 9216)
+                            if gt_areas[gi] <= 9216:
+                                total_oks += oks_scores[gi]
+                                num_oks_matched += 1
                             matched_gt.add(gi)
                             break
 
@@ -277,9 +287,41 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
             losses = sum(loss_dict[k] * weight_dict.get(k, 1.0) for k in loss_dict.keys() if k in weight_dict)
             total_val_loss += losses.item()
             num_val_batches += 1
+            
+            # Accumulate per-component losses (weighted)
+            for k in loss_dict.keys():
+                if k in weight_dict:
+                    component_loss = (loss_dict[k].item() * weight_dict[k])
+                    if k not in per_component_losses:
+                        per_component_losses[k] = 0.0
+                    per_component_losses[k] += component_loss
+            
+            # Track RLE sigma statistics if available
+            if hasattr(criterion, 'log_sigma'):
+                log_sigma = criterion.log_sigma.detach().cpu()
+                sigma = torch.exp(log_sigma)
+                sigma_vals = sigma.numpy()
+                sigma_stats['sigma_min'] = min(sigma_stats['sigma_min'], sigma_vals.min())
+                sigma_stats['sigma_max'] = max(sigma_stats['sigma_max'], sigma_vals.max())
+                sigma_stats['sigma_sum'] += sigma_vals.mean()
+                sigma_stats['sigma_count'] += 1
 
     val_loss = total_val_loss / max(num_val_batches, 1) if num_val_batches > 0 else 0.0
     mean_oks = total_oks / max(num_oks_matched, 1)
+    
+    # Normalize per-component losses by batch count
+    per_component_losses_avg = {}
+    for k, v in per_component_losses.items():
+        per_component_losses_avg[k] = v / max(num_val_batches, 1)
+    
+    # Normalize sigma stats
+    sigma_stats_avg = {}
+    if sigma_stats['sigma_count'] > 0:
+        sigma_stats_avg['sigma_mean'] = sigma_stats['sigma_sum'] / sigma_stats['sigma_count']
+        sigma_stats_avg['sigma_min'] = sigma_stats['sigma_min']
+        sigma_stats_avg['sigma_max'] = sigma_stats['sigma_max']
+    else:
+        sigma_stats_avg = {'sigma_mean': 0.0, 'sigma_min': 0.0, 'sigma_max': 0.0}
 
     return {
         'coco_results': coco_results,
@@ -292,4 +334,6 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
         'total_oks': total_oks,  # For distributed aggregation
         'num_val_batches': num_val_batches,  # For distributed aggregation
         'inference_time': total_inference_time,  # Total inference time in seconds
+        'per_component_losses': per_component_losses_avg,  # Per-component weighted losses
+        'sigma_stats': sigma_stats_avg,  # RLE sigma statistics
     }

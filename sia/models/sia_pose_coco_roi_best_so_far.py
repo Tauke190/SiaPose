@@ -1,18 +1,85 @@
 # ============================================================================
-# ROI Decoder variant for Pose Estimation
+# SIA Pose: ROI-based Decoder Variant for COCO Keypoint Estimation
 # ============================================================================
 #
-# Architecture:
-#   Encoder (ViT): [image_patches + det_tokens] -> spatial_features + det_x
-#   Det Heads:     det_x -> bboxes (cx, cy, w, h), human scores
-#   ROI Extract:   spatial_features + bboxes -> per-detection ROI features
-#   Pose Decoder:  pose_queries + cross-attn(ROI_features) -> pose_x
-#   Pose Heads:    pose_x -> keypoints [B, N, 17, 3]
+# ARCHITECTURE OVERVIEW:
+# ──────────────────────────────────────────────────────────────────────────
 #
-# Key difference from SIA_POSE_SIMPLE_DEC:
-#   The decoder cross-attends to ROI features (only patches inside each
-#   detected bbox) rather than ALL spatial patches. This focuses the
-#   pose decoder on the relevant person region.
+# 1. ENCODER (Vision Transformer)
+#    ├─ Input: Image → patches + temporal frames
+#    ├─ Spatial Positional Embedding: [CLS] + patch positions + temporal positions
+#    ├─ Detection Tokens: learnable [DET] tokens (N tokens, concatenated with patches)
+#    ├─ Transformer Blocks: 12 layers (ViT-B/16) / 24 layers (ViT-L/14)
+#    │  └─ Optional multi-layer fusion: collect intermediate features (fusion_layers)
+#    ├─ Output: spatial_features [B, H*W*T, D], det_x [B, N, D]
+#    └─ Feature Fusion (optional): weighted combination of intermediate + final layers
+#
+# 2. DETECTION HEADS
+#    ├─ Input: det_x [B, N, D]
+#    ├─ Class Projection: det_x @ proj → logits (for Hungarian matching)
+#    ├─ BBox Regression: linear → (cx, cy, w, h) normalized, then sigmoid
+#    ├─ Human Classifier: linear → human/background logits
+#    └─ Output: bboxes [B, N, 4], human_logits [B, N, 2]
+#
+# 3. ROI EXTRACTION (CUDA-optimized)
+#    ├─ Input: spatial_features [B, H*W*T, D], bboxes [B, N, 4]
+#    ├─ Method: torchvision.ops.roi_align with fixed output size (P×P)
+#    │  ├─ Converts normalized (cx, cy, w, h) → patch-space (x1, y1, x2, y2)
+#    │  ├─ Bilinear interpolation + CUDA kernel (highly optimized)
+#    │  ├─ Fixed output: PxP tokens per detection (no variable padding)
+#    │  └─ ROI Positional Embedding: learnable 2D grid [P², D]
+#    ├─ Temporal Averaging: if multiple frames, average before extraction
+#    └─ Output: roi_features [B, N, P², D], roi_mask=None (no padding waste)
+#
+# 4. POSE DECODER (Learnable, Non-Positional)
+#    ├─ Pose Queries: learnable tokens + det_positional_embedding (shared identity)
+#    │  └─ CRITICAL: pose_query[i] ~ det_slot[i] after Hungarian matching
+#    ├─ Multi-Layer Decoding (3 layers default):
+#    │  ├─ Self-Attention: all N queries interact globally
+#    │  ├─ Cross-Attention: query[i] attends ONLY to roi_features[i]
+#    │  │  └─ No padding mask (roi_mask=None) → enables PyTorch FlashAttention
+#    │  ├─ FFN: [D → 4D → D] with GELU activation
+#    │  └─ Layer Normalization: pre-norm (norm → sublayer)
+#    ├─ Intermediate Supervision: auxiliary losses from each layer
+#    └─ Output: pose_x [B, N, D] (refined pose embeddings)
+#
+# 5. KEYPOINT HEADS (Efficient Bottleneck Design)
+#    ├─ Input: pose_x [B, N, D]
+#    ├─ Projection: linear [D → 17*256] (per-keypoint hidden feature bottleneck)
+#    ├─ Per-Keypoint Processing:
+#    │  ├─ Query-specific feature: [B, N, 17, 256]
+#    │  ├─ Prediction head: [256 → 3] predicts (x, y, visibility)
+#    │  ├─ Relative Offsets: tanh(-1, 1) normalized relative to bbox center
+#    │  └─ Visibility Score: sigmoid(0, 1) confidence of visibility
+#    ├─ Global Conversion: offset×bbox_size + bbox_center → global (x, y)
+#    └─ Output: keypoints [B, N, 17, 3] (x, y, vis) normalized to [0, 1]
+#
+# KEY DESIGN PRINCIPLES:
+# ──────────────────────────────────────────────────────────────────────────
+#
+# ROI-focused Attention:
+#   Unlike full-image methods, each pose query attends ONLY to patches within
+#   the detected bounding box (via roi_align). This drastically reduces
+#   attention computation and focuses the model on relevant person regions.
+#
+# Shared Slot Identity:
+#   Pose queries use det_positional_embedding (not separate embeddings) so
+#   pose_slot[i] and det_slot[i] have consistent identity. This ensures
+#   Hungarian matching properly supervises both detection and pose outputs.
+#
+# Fixed-Size ROI Features:
+#   roi_align with fixed output_size (P×P, e.g., 14×14=196 tokens) eliminates
+#   padding waste and enables efficient PyTorch FlashAttention via SDPA.
+#   Variable-length extraction is available (max_roi_cap mode) for compatibility.
+#
+# Multi-Layer Feature Fusion:
+#   Optional feature fusion combines intermediate ViT blocks with final-layer
+#   spatial features (weighted softmax combination). This enriches context with
+#   multi-scale information while maintaining CUDA efficiency.
+#
+# Auxiliary Supervision:
+#   Each pose decoder layer produces keypoint predictions, enabling supervision
+#   at multiple depths. Intermediate layer losses encourage gradual refinement.
 #
 # ============================================================================
 
@@ -105,23 +172,7 @@ def extract_roi_features_aligned(spatial_features, bboxes, H_patches, W_patches,
     P = output_size
     roi_features = roi_out.reshape(B, N, D, P * P).permute(0, 1, 3, 2)
 
-    # Statistics for logging (all fixed-size, zero waste)
-    roi_stats = {
-        'roi_count': B * N,
-        'roi_mean': float(P * P),
-        'roi_std': 0.0,
-        'roi_min': P * P,
-        'roi_max': P * P,
-        'roi_median': float(P * P),
-        'max_roi_len': P * P,
-        'max_roi_cap': 0,
-        'capped_count': 0,
-        'padding_waste_pct': 0.0,
-        'total_slots': B * N * P * P,
-        'valid_patches': B * N * P * P,
-    }
-
-    return roi_features, None, roi_stats
+    return roi_features, None, {}
 
 
 # ROI Pose Decoder Layer
@@ -213,7 +264,7 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         temp_embed=True, det_token_num=100,
         num_keypoints=17, decoder_layers=3, max_roi_cap=0,
         roi_output_size=14,
-        fusion_layers=None,
+        fusion_layers=None
     ):
         # Parent encoder with NO pose handling
         super().__init__(
@@ -253,26 +304,31 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             )
             nn.init.normal_(self.roi_pos_embed, std=0.02)
 
-        # Multi-layer feature fusion
-        # fusion_layers: list of ViT block indices whose outputs are fused with
-        # the final-layer spatial features before ROI extraction.
-        # When empty, the forward pass is identical to the original code.
-        self.fusion_layers = list(fusion_layers) if fusion_layers else []
-        if self.fusion_layers:
-            for li in self.fusion_layers:
+        # FPN-style multi-level ROI extraction with scale-aware routing
+        # fusion_layers: list of ViT block indices to capture as intermediate FPN levels.
+        # When enabled: runs roi_align per level, then blends ROI features per-detection
+        # based on bbox area (small bbox -> early levels, large bbox -> final level).
+        self.fpn_layers = list(fusion_layers) if fusion_layers else []
+        if self.fpn_layers:
+            for li in self.fpn_layers:
                 assert 0 <= li < layers, \
-                    f"fusion_layers index {li} out of range [0, {layers})"
-            num_fused = len(self.fusion_layers)
-            # Separate LayerNorm per intermediate: intermediate activations have
+                    f"fpn_layers index {li} out of range [0, {layers})"
+            num_fpn_levels_intermediate = len(self.fpn_layers)
+            # Separate LayerNorm per intermediate level: intermediate activations have
             # different scale/shift than ln_post-normalised final features.
-            self.fusion_layer_norms = nn.ModuleList([
-                nn.LayerNorm(width) for _ in range(num_fused)
+            self.fpn_layer_norms = nn.ModuleList([
+                nn.LayerNorm(width) for _ in range(num_fpn_levels_intermediate)
             ])
-            # Learned scalar weights: [num_fused + 1], last slot = final layer.
-            # Init biased toward final layer so the model starts near baseline.
-            fusion_init = torch.zeros(num_fused + 1)
-            fusion_init[-1] = 2.0
-            self.fusion_weights = nn.Parameter(fusion_init)
+            # Total FPN levels = intermediates + final layer
+            num_fpn_levels = num_fpn_levels_intermediate + 1
+            import math
+            # Scale centers in sqrt(pixels): evenly log-spaced from 32px to 256px.
+            # These cover small (~2×2 patches) to large persons at 480×640 input.
+            lo = math.log2(32.0)
+            hi = math.log2(256.0)
+            centers_log = torch.linspace(lo, hi, num_fpn_levels)
+            self.fpn_scale_centers = nn.Parameter(2.0 ** centers_log)  # [num_levels]
+            self.fpn_log_sigma = nn.Parameter(torch.tensor(0.75))       # bandwidth (log2 space)
 
         # ROI pose decoder: self-attn + cross-attn(ROI) + FFN per layer
         self.pose_decoder_module = nn.ModuleList([
@@ -338,8 +394,8 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # BND -> NBD
 
-        if self.fusion_layers:
-            x, intermediates = self.transformer(x, return_layers=set(self.fusion_layers))
+        if self.fpn_layers:
+            x, intermediates = self.transformer(x, return_layers=set(self.fpn_layers))
         else:
             x = self.transformer(x)
             intermediates = None
@@ -354,23 +410,6 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             spatial_features = x.permute(1, 0, 2)
             det_x = self.dropout(x.reshape(H*W, T, B, C).mean(1)).permute(1, 0, 2)
 
-        # Multi-layer feature fusion: weighted sum of intermediate + final spatial features
-        if intermediates is not None:
-            fused_list = []
-            for i, layer_idx in enumerate(self.fusion_layers):
-                # Extract spatial tokens from NBD format (exclude det_tokens at end)
-                if self.det_token_num > 0:
-                    inter_sp = intermediates[layer_idx][:-self.det_token_num].permute(1, 0, 2)
-                else:
-                    inter_sp = intermediates[layer_idx].permute(1, 0, 2)
-                inter_sp = self.fusion_layer_norms[i](inter_sp)
-                fused_list.append(inter_sp)
-            fused_list.append(spatial_features)  # final layer (already ln_post normalized)
-
-            w = torch.softmax(self.fusion_weights, dim=0)          # [num_fused+1]
-            stacked = torch.stack(fused_list, dim=0)               # [num_fused+1, B, H*W*T, D]
-            spatial_features = (w.view(-1, 1, 1, 1) * stacked).sum(0)  # [B, H*W*T, D]
-
         # --- Detection heads ---
         if self.proj is not None:
             class_scores = det_x @ self.proj
@@ -383,19 +422,25 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 
         out = {'pred_logits': class_scores, 'pred_boxes': bboxes, 'human_logits': human_scores}
 
-        # --- ROI extraction ---
-        # Use roi_align for fixed-size ROI features (no padding, FlashAttention enabled)
-        # Falls back to old variable-length extraction if roi_output_size == 0
+        # --- ROI extraction (FPN-style) ---
+        # roi_align per level, then scale-aware blend per detection based on bbox area
         if self.roi_output_size > 0:
-            roi_features, roi_mask, roi_stats = extract_roi_features_aligned(
-                spatial_features=spatial_features,
-                bboxes=bboxes.detach(),
-                H_patches=H,
-                W_patches=W,
-                num_frames=T,
-                output_size=self.roi_output_size,
-                padding=0.1,
-            )
+            if self.fpn_layers:
+                roi_features, roi_stats = self._extract_fpn_roi_features(
+                    intermediates, spatial_features, bboxes.detach(), H, W, T
+                )
+                roi_mask = None  # FPN always produces fixed-size ROIs → FlashAttention OK
+            else:
+                # Fallback: single roi_align on final spatial features (no FPN)
+                roi_features, roi_mask, roi_stats = extract_roi_features_aligned(
+                    spatial_features=spatial_features,
+                    bboxes=bboxes.detach(),
+                    H_patches=H,
+                    W_patches=W,
+                    num_frames=T,
+                    output_size=self.roi_output_size,
+                    padding=0.1,
+                )
             # Add learnable 2D positional embedding to ROI features
             # roi_features: [B, N, P*P, D], roi_pos_embed: [P*P, D]
             roi_features = roi_features + self.roi_pos_embed.unsqueeze(0).unsqueeze(0)
@@ -465,6 +510,115 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         pred_keypoints = torch.cat([keypoints_xy, keypoints_vis], dim=-1)
         return {'pred_keypoints': pred_keypoints}
 
+    def _extract_fpn_roi_features(self, intermediates, spatial_features, bboxes, H, W, T):
+        """
+        FPN-style ROI extraction: run roi_align independently on each ViT level,
+        then blend per-detection using scale-aware Gaussian weights.
+
+        Small persons (few patches) receive high weight on early levels that
+        preserve local texture; large persons weight final semantic features more.
+
+        Args:
+            intermediates: dict[int -> Tensor[N_tok, B, D]] or None
+            spatial_features: [B, H*W*T, D]  final-layer spatial tokens (ln_post applied)
+            bboxes:          [B, N_det, 4]   detached predicted boxes (cx,cy,w,h) normalized
+            H, W:            int  patch grid dimensions
+            T:               int  number of temporal frames
+
+        Returns:
+            roi_features: [B, N_det, P², D]
+            roi_stats:    dict (same schema as extract_roi_features_aligned)
+        """
+        # --- Build ordered feature map list: [level0, level1, ..., final] ---
+        feat_maps = []
+        if intermediates is not None:
+            for i, layer_idx in enumerate(self.fpn_layers):
+                if self.det_token_num > 0:
+                    inter_sp = intermediates[layer_idx][:-self.det_token_num].permute(1, 0, 2)
+                else:
+                    inter_sp = intermediates[layer_idx].permute(1, 0, 2)
+                feat_maps.append(self.fpn_layer_norms[i](inter_sp))  # [B, H*W*T, D]
+        feat_maps.append(spatial_features)  # final level always last
+
+        num_levels = len(feat_maps)
+        assert num_levels <= len(self.fpn_scale_centers), (
+            f"FPN routing: num_levels={num_levels} > len(fpn_scale_centers)="
+            f"{len(self.fpn_scale_centers)}. Reinitialize model with matching fpn_layers."
+        )
+
+        # --- Scale-aware per-detection blend weights: [B, N_det, num_levels] ---
+        H_img = float(H * self.patch_size)
+        W_img = float(W * self.patch_size)
+        weights = self._compute_fpn_weights(bboxes, H_img, W_img, num_levels)
+
+
+        # ---- DIAGNOSTIC: log routing by size category ----
+        with torch.no_grad():
+            area = bboxes[..., 2] * bboxes[..., 3]  # normalized area [B, N_det]
+            small  = area < 0.04**2   # ~32px / 480px threshold
+            medium = (area >= 0.04**2) & (area < 0.12**2)
+            large  = area >= 0.12**2
+
+            self._last_fpn_weights = {}  # Initialize fresh dict each forward
+            for li in range(num_levels):
+                w_li = weights[..., li]  # [B, N_det]
+                # Store ALL levels, don't overwrite
+                self._last_fpn_weights[f'fpn/w_level{li}_small']  = w_li[small].mean().item()  if small.any()  else 0.
+                self._last_fpn_weights[f'fpn/w_level{li}_medium'] = w_li[medium].mean().item() if medium.any() else 0.
+                self._last_fpn_weights[f'fpn/w_level{li}_large']  = w_li[large].mean().item()  if large.any()  else 0.
+
+            # Also log FPN learnable parameters
+            self._last_fpn_weights['fpn/sigma'] = self.fpn_log_sigma.detach().cpu().item()
+            for i, center in enumerate(self.fpn_scale_centers):
+                self._last_fpn_weights[f'fpn/scale_center_{i}'] = center.detach().cpu().item()
+        # ---- END DIAGNOSTIC ----
+
+        # --- roi_align per level, memory-efficient weighted accumulation ---
+        # Avoids materializing all levels simultaneously (peak = 2× one level).
+        roi_features = None
+        for li, feat in enumerate(feat_maps):
+            roi_i, _, _ = extract_roi_features_aligned(
+                spatial_features=feat,
+                bboxes=bboxes,
+                H_patches=H,
+                W_patches=W,
+                num_frames=T,
+                output_size=self.roi_output_size,
+                padding=0.1,
+            )  # [B, N_det, P², D]
+            wi = weights[:, :, li].unsqueeze(-1).unsqueeze(-1)  # [B, N_det, 1, 1]
+            roi_features = wi * roi_i if roi_features is None else roi_features + wi * roi_i
+
+        return roi_features, {}
+
+    def _compute_fpn_weights(self, bboxes, H_img, W_img, num_levels):
+        """
+        Per-detection scale weights using a Gaussian in log2(sqrt(area_pixels)) space.
+
+        Maps each detection to a soft assignment across FPN levels:
+          - small bbox  → high weight on early levels (fine-grained texture)
+          - large bbox  → high weight on final level  (semantic features)
+
+        Args:
+            bboxes:     [B, N_det, 4]  normalized (cx, cy, w, h)
+            H_img:      int  image height in pixels (H_patches × patch_size)
+            W_img:      int  image width  in pixels (W_patches × patch_size)
+            num_levels: int  number of FPN levels to produce weights for
+
+        Returns:
+            weights: [B, N_det, num_levels]  summing to 1 along dim=-1
+        """
+        area = (bboxes[..., 2] * W_img) * (bboxes[..., 3] * H_img)   # [B, N_det]
+        sqrt_area = area.clamp(min=1.0).sqrt()
+        log_sqrt = torch.log2(sqrt_area).unsqueeze(-1)                  # [B, N_det, 1]
+
+        centers = self.fpn_scale_centers[:num_levels].clamp(min=1.0)   # [num_levels]
+        log_centers = torch.log2(centers)                               # [num_levels]
+
+        sigma = self.fpn_log_sigma.abs().clamp(min=0.1)
+        neg_sq_dist = -((log_sqrt - log_centers) ** 2) / (2.0 * sigma ** 2)
+        return torch.softmax(neg_sq_dist, dim=-1)                       # [B, N_det, num_levels]
+
 
 # ============================================================================
 # Model constructors
@@ -476,7 +630,7 @@ def clip_joint_b16_simple_dec_roi(
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
     roi_output_size=14, fusion_layers=None,
 ):
-    """ViT-B/16 with ROI pose decoder."""
+    """ViT-B/16 with ROI pose decoder and FPN routing."""
     model = VisionTransformerSimpleDecoderROI(
         input_resolution=input_resolution, patch_size=16,
         width=768, layers=12, heads=12, output_dim=512,
@@ -502,7 +656,7 @@ def clip_joint_l14_simple_dec_roi(
     dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
     roi_output_size=14, fusion_layers=None,
 ):
-    """ViT-L/14 with ROI pose decoder."""
+    """ViT-L/14 with ROI pose decoder and FPN routing."""
     model = VisionTransformerSimpleDecoderROI(
         input_resolution=input_resolution, patch_size=14,
         width=1024, layers=24, heads=16, output_dim=768,
@@ -521,7 +675,6 @@ def clip_joint_l14_simple_dec_roi(
         load_state_dict(model, state_dict, input_resolution=input_resolution, patch_size=14, center=center)
     return model.eval()
 
-
 # ============================================================================
 # Utility functions (same as sia_pose_simple.py)
 # ============================================================================
@@ -532,7 +685,6 @@ def interpolate_temporal_pos_embed(temp_embed_old, num_frames_new):
     temp_embed_new = F.interpolate(temp_embed_old, num_frames_new, mode="linear")
     temp_embed_new = temp_embed_new.permute(0, 2, 1).unsqueeze(2)
     return temp_embed_new
-
 
 def load_temp_embed_with_mismatch(temp_embed_old, temp_embed_new, add_zero=False):
     """Handle temporal embedding length mismatch."""
@@ -550,7 +702,6 @@ def load_temp_embed_with_mismatch(temp_embed_old, temp_embed_new, add_zero=False
         temp_embed_new = temp_embed_old
     return temp_embed_new
 
-
 def interpolate_pos_embed_vit(state_dict, new_model):
     """Interpolate positional embeddings for ViT."""
     key = "vision_encoder.temporal_positional_embedding"
@@ -565,7 +716,6 @@ def interpolate_pos_embed_vit(state_dict, new_model):
         ).squeeze(2)
 
     return state_dict
-
 
 # ============================================================================
 # Wrapper class
@@ -618,8 +768,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
         self.decoder_layers = decoder_layers
         self.max_roi_cap = max_roi_cap
         self.roi_output_size = roi_output_size
-        self.fusion_layers = list(fusion_layers) if fusion_layers else []
-        self._last_roi_stats = {}  # Initialize for logging
+        self.fpn_layers = list(fusion_layers) if fusion_layers else []  # FPN level indices
+        self._last_fpn_weights = {}  # Initialize for logging
 
         if self.det_token_num > 0:
             print(f'Type: [DET] regression (DEC-ROI, {decoder_layers} decoder layers)')
@@ -628,8 +778,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
 
         roi_info = f'roi_align {roi_output_size}x{roi_output_size}={roi_output_size**2} tokens' if roi_output_size > 0 else f'variable-len (cap={max_roi_cap})'
         print(f'Dec-ROI pose: {num_keypoints} keypoints, {decoder_layers} decoder layers, {roi_info}')
-        if self.fusion_layers:
-            print(f'Feature fusion layers: {self.fusion_layers}')
+        if self.fpn_layers:
+            print(f'FPN routing: levels {self.fpn_layers} + final layer')
 
         # Build vision encoder
         self.vision_encoder = self.build_vision_encoder()
@@ -668,9 +818,9 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
         else:
             output = self.vision_encoder(image)
 
-        # Propagate ROI statistics from vision_encoder to wrapper model for logging
-        if hasattr(self.vision_encoder, '_last_roi_stats'):
-            self._last_roi_stats = self.vision_encoder._last_roi_stats
+        # Propagate FPN weights statistics from vision_encoder to wrapper model for logging
+        if hasattr(self.vision_encoder, '_last_fpn_weights'):
+            self._last_fpn_weights = self.vision_encoder._last_fpn_weights
 
         return output
 
@@ -691,7 +841,7 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                 decoder_layers=self.decoder_layers,
                 max_roi_cap=self.max_roi_cap,
                 roi_output_size=self.roi_output_size,
-                fusion_layers=self.fusion_layers,
+                fusion_layers=self.fpn_layers,
             )
         elif encoder_name == "vit_b16":
             vision_encoder = clip_joint_b16_simple_dec_roi(
@@ -707,7 +857,7 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                 decoder_layers=self.decoder_layers,
                 max_roi_cap=self.max_roi_cap,
                 roi_output_size=self.roi_output_size,
-                fusion_layers=self.fusion_layers,
+                fusion_layers=self.fpn_layers,
             )
         else:
             raise NotImplementedError(f"Not implemented: {encoder_name}")

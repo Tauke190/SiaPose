@@ -55,8 +55,8 @@ class COCOPose(Dataset):
         annFile,
         transforms=None,
         frames=9,
-        min_keypoints=5,
-        min_area=32 * 32,
+        min_keypoints=1,
+        min_area=0,
         augment=True,
     ):
         self.root = root
@@ -180,8 +180,6 @@ class COCOPose(Dataset):
 
         # Load image
         img_path = os.path.join(self.root, img_info['file_name'])
-        # Handle misconfigured paths with extra 'images/' directory
-        img_path = img_path.replace('/images/', '/')
         img = Image.open(img_path).convert('RGB')
         img_w, img_h = img.size
 

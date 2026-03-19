@@ -61,8 +61,9 @@ def parse_args():
     parser.add_argument("-ROI_SIZE", type=int, default=14,
                         help="ROI output size P (each ROI -> PxP tokens via roi_align). 14=196 tokens, 7=49 tokens. 0=fallback to variable-length")
     parser.add_argument("-FUSION_LAYERS", type=str, default="",
-                        help="Comma-separated ViT block indices to fuse with final-layer features before ROI extraction. "
-                             "E.g. '6,8,10' for ViT-B/16 or '12,16,20' for ViT-L/24. Default '' = no fusion.")
+                        help="Comma-separated ViT block indices to capture as FPN intermediate levels. "
+                             "E.g. '3,6,9' for ViT-B/16 (4 levels) or '8,16,20' for ViT-L/24 (4 levels). "
+                             "Default '' = no FPN (single roi_align). Recommended: 3,6,9 with ROI_SIZE 14.")
     parser.add_argument("--FREEZE_BACKBONE", action="store_true",
                         help="Freeze vision encoder, train only pose heads (use with pretrained weights)")
 
@@ -115,9 +116,12 @@ def parse_args():
     parser.add_argument("-EXP", type=str, default='pose_coco',
                         help="Experiment name for saving")
     parser.add_argument("--SAVE", action='store_true',
-                        help="Save best model checkpoint")
+                        help="Save model checkpoint every epoch")
+    parser.add_argument("-BACKBONE", type=str, default=None,
+                        help="Path to pretrained backbone/encoder weights to initialise from (strict=False)")
     parser.add_argument("--RESUME", type=str, default=None,
-                        help="Path to checkpoint to resume from")
+                        help="Path to a training checkpoint to continue training "
+                             "(restores model weights, optimizer, scheduler, and epoch)")
 
     # Validation & Logging
     parser.add_argument("-VAL_FREQ", type=int, default=1,
@@ -255,7 +259,7 @@ def build_model(args, rank):
             roi_output_size=args.ROI_SIZE,
         )['sia']
     elif args.MODEL == 'sia_pose_coco_roi_best':
-        # ROI-based decoder (optimized): uses roi_align for faster CUDA-accelerated ROI extraction
+        # ROI-based decoder with FPN routing: multi-level roi_align with scale-aware blending
         model = get_sia_pose_coco_roi_best(
             size=size,
             pretrain=pretrain,
@@ -362,7 +366,7 @@ def freeze_encoder(model):
             'roi_pos_embed',                                               # ROI positional embedding
             'det_proj', 'pose_proj',                                       # Token splitting projections
             'stage2_encoder', 'pose_token', 'pose_positional_embedding',   # EOMT model
-            'fusion_weights', 'fusion_layer_norms',                        # multi-layer feature fusion
+            'fpn_layer_norms', 'fpn_scale_centers', 'fpn_log_sigma',       # FPN routing parameters
         ]):
             param.requires_grad = True
             trainable_count += param.numel()
@@ -451,7 +455,7 @@ def build_optimizer(model, args, criterion=None):
                     'roi_pos_embed' in name or
                     'det_proj' in name or 'pose_proj' in name or
                     'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name or
-                    'fusion_weights' in name or 'fusion_layer_norms' in name):
+                    'fpn_layer_norms' in name or 'fpn_scale_centers' in name or 'fpn_log_sigma' in name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
@@ -576,27 +580,7 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
 
             # Log to wandb periodically
             if use_wandb and (batch_idx + 1) % wandb_log_freq == 0:
-                global_step = epoch * num_total_batches + batch_idx
-                wandb_metrics = {
-                    'train/loss': loss_value,
-                    'train/det_loss': det_loss,
-                    'train/pose_loss': pose_loss,
-                    'train/grad_norm': grad_norm,
-                    'train/epoch': epoch + (batch_idx + 1) / num_total_batches,
-                    'train/total_detections': total_train_det,
-                }
-                for k, v in loss_dict.items():
-                    if k in weight_dict:
-                        wandb_metrics[f'train/{k}'] = v.item()
-
-                # Monitor RLE sigma (learnable uncertainty in keypoint loss)
-                if hasattr(criterion, 'log_sigma'):
-                    log_sigma = criterion.log_sigma.detach().cpu()
-                    wandb_metrics['train/sigma_min'] = log_sigma.min().item()
-                    wandb_metrics['train/sigma_max'] = log_sigma.max().item()
-                    wandb_metrics['train/sigma_mean'] = log_sigma.mean().item()
-
-                wandb.log(wandb_metrics, step=global_step)
+                pass  # Batch-level training logging disabled
 
             # Log detailed losses to console every LOG steps
             if (batch_idx + 1) % log_freq == 0 or batch_idx == 0:
@@ -616,6 +600,20 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                     # Warn if sigma grows too large (divergence risk)
                     if sigma_max > 2.0:
                         log_msg += f" [WARNING: High sigma detected]"
+
+                # Console logging for FPN diagnostics (if FPN is enabled)
+                if hasattr(model, '_last_fpn_weights') and model._last_fpn_weights:
+                    fpn_msg = "  FPN routing:"
+                    # Group by level for readability
+                    num_levels = sum(1 for k in model._last_fpn_weights.keys() if 'w_level' in k and k.endswith('_small'))
+                    for li in range(num_levels):
+                        s = model._last_fpn_weights.get(f'fpn/w_level{li}_small', 0.)
+                        m = model._last_fpn_weights.get(f'fpn/w_level{li}_medium', 0.)
+                        l = model._last_fpn_weights.get(f'fpn/w_level{li}_large', 0.)
+                        fpn_msg += f" | L{li}(s:{s:.2f} m:{m:.2f} l:{l:.2f})"
+                    sigma = model._last_fpn_weights.get('fpn/sigma', 0.)
+                    fpn_msg += f" | σ:{sigma:.4f}"
+                    log_msg += "\n" + fpn_msg
 
                 if rank == 0:
                     print(log_msg, flush=True)
@@ -645,9 +643,21 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                     'val/total_detections': val_stats['total_det'],
                     'val/total_gt': val_stats['total_gt'],
                 }
-                for k in ['AP', 'AP50', 'AP75', 'AR', 'mean_oks']:
+                # Log AP metrics (overall, medium, large, and OKS)
+                for k in ['AP', 'AP50', 'AP75', 'AP_M', 'AP_L', 'AR', 'AR_M', 'AR_L', 'mean_oks']:
                     if k in val_stats:
                         wandb_val[f'val/{k}'] = val_stats[k]
+                
+                # Log per-component loss breakdown
+                if 'per_component_losses' in val_stats and val_stats['per_component_losses']:
+                    for loss_name, loss_val in val_stats['per_component_losses'].items():
+                        wandb_val[f'val/{loss_name}'] = loss_val
+                
+                # Log RLE sigma statistics
+                if 'sigma_stats' in val_stats and val_stats['sigma_stats']:
+                    for stat_name, stat_val in val_stats['sigma_stats'].items():
+                        wandb_val[f'val/{stat_name}'] = stat_val
+                
                 wandb.log(wandb_val, step=global_step)
             model.train()  # Switch back to train mode
 
@@ -692,6 +702,8 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
     val_loss_sum = val_results['val_loss'] * val_results.get('num_val_batches', max(num_images // args.BS, 1))
     num_oks_matched = val_results['num_oks_matched']
     num_val_batches = val_results.get('num_val_batches', max(num_images // args.BS, 1))
+    per_component_losses = val_results.get('per_component_losses', {})
+    sigma_stats = val_results.get('sigma_stats', {})
 
     # Aggregate stats across all GPUs in distributed mode
     if world_size > 1 and dist.is_initialized():
@@ -718,6 +730,36 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
         val_loss_sum = stats_tensor[5].item()
         num_val_batches = int(stats_tensor[6].item())
         
+        # Gather per-component losses from all GPUs and average them
+        if per_component_losses:
+            # Convert to tensor for aggregation
+            component_names = sorted(per_component_losses.keys())
+            component_vals = torch.tensor(
+                [per_component_losses.get(k, 0.0) for k in component_names],
+                dtype=torch.float32,
+                device=device
+            )
+            dist.all_reduce(component_vals, op=dist.ReduceOp.SUM)
+            # Average across GPUs
+            component_vals = component_vals / world_size
+            per_component_losses = {k: component_vals[i].item() for i, k in enumerate(component_names)}
+        
+        # Average sigma stats across GPUs
+        if sigma_stats and 'sigma_mean' in sigma_stats:
+            sigma_tensor = torch.tensor(
+                [sigma_stats.get('sigma_mean', 0.0), 
+                 sigma_stats.get('sigma_min', float('inf')), 
+                 sigma_stats.get('sigma_max', float('-inf'))],
+                dtype=torch.float32,
+                device=device
+            )
+            dist.all_reduce(sigma_tensor, op=dist.ReduceOp.SUM)
+            sigma_stats = {
+                'sigma_mean': (sigma_tensor[0] / world_size).item(),
+                'sigma_min': sigma_tensor[1].item(),
+                'sigma_max': sigma_tensor[2].item(),
+            }
+        
         # Gather coco_results from all GPUs for COCO evaluation
         gathered_results = [None] * world_size
         dist.all_gather_object(gathered_results, coco_results)
@@ -735,7 +777,7 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
     coco_stats = {}
     if rank == 0:
         print(f"Validation: {num_images} images, {total_gt} GT persons, {total_det} detections, "
-              f"val_loss: {val_loss:.4f}, mean_oks: {mean_oks:.4f} ({num_oks_matched} matched)", flush=True)
+              f"val_loss: {val_loss:.4f}, mean_oks (small+medium): {mean_oks:.4f} ({num_oks_matched} matched)", flush=True)
         # COCO evaluation via pycocotools (PoseTrack uses OKS metric only)
         if not is_posetrack:
             coco_stats = run_coco_eval(args.VAL_ANN, coco_results, sigmas=COCO_SIGMAS)
@@ -745,6 +787,8 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
         'total_det': total_det,
         'val_loss': val_loss,
         'mean_oks': mean_oks,
+        'per_component_losses': per_component_losses,
+        'sigma_stats': sigma_stats,
         **coco_stats,
     }
 
@@ -792,11 +836,14 @@ def main(args):
         print("Building model...", flush=True)
     model = build_model(args, rank)
 
-    # Resume from checkpoint
-    if args.RESUME:
+    # Load pretrained backbone weights (strict=False: new heads are randomly initialised)
+    start_epoch = 0
+    _resume_train_ckpt = None  # held until optimizer/scheduler are built
+    _resume_best_ap = 0.0
+    if args.BACKBONE:
         if is_main_process():
-            print(f"Resuming from {args.RESUME}", flush=True)
-        state_dict = torch.load(args.RESUME, map_location='cpu', weights_only=False)
+            print(f"Loading pretrained backbone from {args.BACKBONE}", flush=True)
+        state_dict = torch.load(args.BACKBONE, map_location='cpu', weights_only=False)
 
         # Handle temporal positional embedding mismatch (e.g. checkpoint=9 frames, model=1 frame)
         key = "vision_encoder.temporal_positional_embedding"
@@ -811,6 +858,38 @@ def main(args):
                 state_dict[key] = new_embed.permute(0, 2, 3, 1).squeeze(2)  # [1, T_new, C]
 
         model.load_state_dict(state_dict, strict=False)
+
+    # Continue training from a saved checkpoint (model + optimizer + scheduler + epoch)
+    if args.RESUME:
+        if is_main_process():
+            print(f"Continuing training from {args.RESUME}", flush=True)
+        _resume_train_ckpt = torch.load(args.RESUME, map_location='cpu', weights_only=False)
+        is_full_train_ckpt = (
+            isinstance(_resume_train_ckpt, dict)
+            and 'model' in _resume_train_ckpt
+            and 'optimizer' in _resume_train_ckpt
+            and 'scheduler' in _resume_train_ckpt
+            and 'epoch' in _resume_train_ckpt
+        )
+
+        if is_full_train_ckpt:
+            model.load_state_dict(_resume_train_ckpt['model'])
+            start_epoch = _resume_train_ckpt['epoch'] + 1
+            _resume_best_ap = _resume_train_ckpt.get('best_ap', 0.0)
+            if is_main_process():
+                print(f"  Resuming from epoch {start_epoch}, best_ap={_resume_best_ap:.4f}", flush=True)
+        else:
+            state_dict = _resume_train_ckpt.get('model', _resume_train_ckpt) if isinstance(_resume_train_ckpt, dict) else _resume_train_ckpt
+            model.load_state_dict(state_dict, strict=False)
+            start_epoch = (_resume_train_ckpt.get('epoch', -1) + 1) if isinstance(_resume_train_ckpt, dict) else 0
+            _resume_best_ap = _resume_train_ckpt.get('best_ap', 0.0) if isinstance(_resume_train_ckpt, dict) else 0.0
+            _resume_train_ckpt = None
+            if is_main_process():
+                print(
+                    "  Loaded weights-only checkpoint; optimizer/scheduler state not found. "
+                    f"Starting with fresh optimizer/scheduler from epoch {start_epoch}.",
+                    flush=True,
+                )
 
     # Freeze encoder parameters if requested
     if args.FREEZE_BACKBONE:
@@ -839,6 +918,17 @@ def main(args):
 
     # Build scheduler with linear warmup (10 epochs) + flat hold (15 epochs) + cosine annealing
     scheduler = build_scheduler(optimizer, total_epochs=args.EPOCH, warmup_epochs=10, flat_epochs=15)
+
+    # Restore optimizer + scheduler state when continuing a training run
+    if _resume_train_ckpt is not None:
+        optimizer.load_state_dict(_resume_train_ckpt['optimizer'])
+        scheduler.load_state_dict(_resume_train_ckpt['scheduler'])
+        # Move optimizer state tensors to the correct device
+        for state in optimizer.state.values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        del _resume_train_ckpt  # free memory
 
     # Build datasets
     if is_main_process():
@@ -941,15 +1031,45 @@ def main(args):
 
     # Training loop
     if is_main_process():
-        print(f"\nStarting training for {args.EPOCH} epochs...", flush=True)
-        print(f"Train: {len(train_dataset)} images, Val: {len(val_dataset) if not args.NO_VAL else 0} images", flush=True)
-        print(f"Batch size: {args.BS} x {world_size} GPUs = {args.BS * world_size} effective", flush=True)
+        print(f"\n" + "="*80)
+        print(f"DATASET SUMMARY")
+        print(f"="*80)
+        print(f"Training dataset:   {len(train_dataset):>7,} images")
+        if hasattr(train_dataset, 'coco'):
+            # Count annotations with keypoints >= 1 in the training images
+            train_anns_with_kp = 0
+            train_anns_total = 0
+            for img_id in train_dataset.img_ids:
+                ann_ids = train_dataset.coco.getAnnIds(imgIds=img_id, catIds=train_dataset.cat_ids, iscrowd=False)
+                anns = train_dataset.coco.loadAnns(ann_ids)
+                train_anns_total += len(anns)
+                train_anns_with_kp += len([a for a in anns if a.get('num_keypoints', 0) >= 1])
+            print(f"                    {train_anns_with_kp:>7,} annotations with ≥1 keypoint")
+            print(f"                    {train_anns_total:>7,} total annotations")
+        if not args.NO_VAL:
+            print(f"Validation dataset: {len(val_dataset):>7,} images")
+            if hasattr(val_dataset, 'coco'):
+                # Count annotations with keypoints >= 1 in the validation images
+                val_anns_with_kp = 0
+                val_anns_total = 0
+                for img_id in val_dataset.img_ids:
+                    ann_ids = val_dataset.coco.getAnnIds(imgIds=img_id, catIds=val_dataset.cat_ids, iscrowd=False)
+                    anns = val_dataset.coco.loadAnns(ann_ids)
+                    val_anns_total += len(anns)
+                    val_anns_with_kp += len([a for a in anns if a.get('num_keypoints', 0) >= 1])
+                print(f"                    {val_anns_with_kp:>7,} annotations with ≥1 keypoint")
+                print(f"                    {val_anns_total:>7,} total annotations")
+        else:
+            print(f"Validation dataset: DISABLED")
+        print(f"Batch size: {args.BS} x {world_size} GPUs = {args.BS * world_size} effective")
+        print(f"\nStarting training for {args.EPOCH} epochs...")
+        print(f"="*80 + "\n", flush=True)
 
     best_loss = float('inf')
-    best_ap = 0.0  # Track best AP for model saving
+    best_ap = _resume_best_ap  # Restored from checkpoint, or 0.0 for a fresh run
     train_stats = []
 
-    for epoch in range(args.EPOCH):
+    for epoch in range(start_epoch, args.EPOCH):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
@@ -986,26 +1106,54 @@ def main(args):
             epoch_metrics = {
                 'epoch/train_loss': avg_loss,
                 'epoch/lr': scheduler.get_last_lr()[0],
-                'epoch/train_detections': total_train_det,
                 'epoch': epoch,
             }
             if val_stats is not None:
                 epoch_metrics['epoch/val_loss'] = val_stats['val_loss']
-                for k in ['AP', 'AP50', 'AP75', 'AR', 'mean_oks']:
+                # Log AP metrics (overall, medium, large, and OKS)
+                for k in ['AP', 'AP50', 'AP75', 'AP_M', 'AP_L', 'AR', 'AR_M', 'AR_L', 'mean_oks']:
                     if k in val_stats:
                         epoch_metrics[f'epoch/{k}'] = val_stats[k]
+                
+                # Log per-component loss breakdown at epoch level
+                if 'per_component_losses' in val_stats and val_stats['per_component_losses']:
+                    for loss_name, loss_val in val_stats['per_component_losses'].items():
+                        epoch_metrics[f'epoch/{loss_name}'] = loss_val
+                
+                # Log RLE sigma statistics at epoch level
+                if 'sigma_stats' in val_stats and val_stats['sigma_stats']:
+                    for stat_name, stat_val in val_stats['sigma_stats'].items():
+                        epoch_metrics[f'epoch/{stat_name}'] = stat_val
+            
             wandb.log(epoch_metrics)
 
-        # Save best checkpoint based on AP score (only during validation)
-        if args.SAVE and is_main_process() and val_stats is not None and 'AP' in val_stats:
-            # Get state dict (handle DDP vs non-DDP model)
-            state_dict = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
-            current_ap = val_stats['AP']
-            if current_ap > best_ap:
-                best_ap = current_ap
+        # Save checkpoint every epoch (full training state for resuming)
+        if args.SAVE and is_main_process():
+            model_sd = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+
+            # Save best checkpoint as full training state package.
+            if val_stats is not None and 'AP' in val_stats and val_stats['AP'] > best_ap:
+                best_ap = val_stats['AP']
                 best_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_best.pt')
-                torch.save(state_dict, best_path)
-                print(f"Saved best model (AP: {best_ap:.4f}): {best_path}", flush=True)
+                torch.save({
+                    'epoch': epoch,
+                    'model': model_sd,
+                    'optimizer': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict(),
+                    'best_ap': best_ap,
+                }, best_path)
+                print(f"Saved best checkpoint (AP: {best_ap:.4f}): {best_path}", flush=True)
+
+            ckpt_path = os.path.join(exp_dir, f'{args.MODEL}_{args.SIZE}_checkpoint.pt')
+            torch.save({
+                'epoch': epoch,
+                'model': model_sd,
+                'optimizer': optimizer.state_dict(),
+                'scheduler': scheduler.state_dict(),
+                'best_ap': best_ap,
+            }, ckpt_path)
+            ap_str = f", AP: {val_stats['AP']:.4f} (best: {best_ap:.4f})" if val_stats and 'AP' in val_stats else ""
+            print(f"Saved checkpoint (epoch {epoch}{ap_str}): {ckpt_path}", flush=True)
 
     # Save training stats only (best model already saved during training)
     if args.SAVE and is_main_process():

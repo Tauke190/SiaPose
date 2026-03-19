@@ -366,7 +366,8 @@ def main():
         print(f"ERROR: Checkpoint not found: {args.checkpoint}")
         sys.exit(1)
 
-    state_dict = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    state_dict = ckpt['model'] if isinstance(ckpt, dict) and 'model' in ckpt else ckpt
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"      Missing keys (initialized from scratch): {missing}")
