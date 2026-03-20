@@ -50,5 +50,5 @@ torchrun --nproc_per_node=2 train_pose.py \
        -VAL_ANN /home/c3-0/datasets/coco/annotations/person_keypoints_val2017.json \
        -BS 128 -EPOCH 200 -LR 5e-4 --SAVE -FRAMES 1 \
        -WORKERS 12 -EXP sia_pose -DET 20 -HEIGHT 480 -WIDTH 640 -LOG 100 -POSE_LAYERS 3 -ROI_SIZE 14 -GRAD_CLIP 1\
-       -BACKBONE weights/avak_b16_11.pt -FUSION_LAYERS 3,6,9 \
+       -BACKBONE weights/avak_b16_11.pt -FUSION_LAYERS 6,9,11 --RESUME weights/sia_pose_coco_roi_best_b16_best.pt \
        --WANDB -WANDB_PROJECT sia-pose -WANDB_RUN sia_pose_coco_roialign_fusion
