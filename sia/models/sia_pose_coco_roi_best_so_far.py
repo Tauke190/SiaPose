@@ -115,7 +115,6 @@ def extract_roi_features_aligned(spatial_features, bboxes, H_patches, W_patches,
 
     Returns:
         roi_features: [B, N, P*P, D] fixed-size ROI features per detection
-        roi_mask:     None (no padding needed)
         roi_stats:    dict with ROI statistics
     """
     B, N, _ = bboxes.shape
@@ -169,7 +168,7 @@ def extract_roi_features_aligned(spatial_features, bboxes, H_patches, W_patches,
     P = output_size
     roi_features = roi_out.reshape(B, N, D, P * P).permute(0, 1, 3, 2)
 
-    return roi_features, None, {}
+    return roi_features, {}
 
 
 # ============================================================================
@@ -186,7 +185,7 @@ class ViTDetNeck(nn.Module):
         P4: 1/16 resolution — identity (ViT final feature map)
         P5: 1/32 resolution — stride-2 2×2 max pooling
 
-    Per-level processing: 1×1 conv → LN → GeLU → 3×3 conv → LN
+    Per-level processing: 1×1 conv → LN → GeLU → 3×3 conv
     No top-down merging — ViT global self-attention already propagates full context.
     """
     def __init__(self, in_channels):
@@ -199,13 +198,14 @@ class ViTDetNeck(nn.Module):
         # LN between the two P2 deconvolutions (ViTDet Appendix A.2:
         # "the first deconvolution is followed by LayerNorm (LN) and GeLU")
         self.deconv_p2_ln = nn.LayerNorm(C)
-        # Per-level 1×1 projections + LN
-        self.proj = nn.ModuleList([nn.Conv2d(C, C, kernel_size=1) for _ in range(4)])
-        self.proj_norm = nn.ModuleList([nn.LayerNorm(C) for _ in range(4)])
-        # Per-level 3×3 smoothing convolutions + LN
-        # (ViTDet: "1×1 conv with LN ... then a 3×3 conv also with LN")
-        self.smooth = nn.ModuleList([nn.Conv2d(C, C, kernel_size=3, padding=1) for _ in range(4)])
-        self.smooth_norm = nn.ModuleList([nn.LayerNorm(C) for _ in range(4)])
+        # ViTDet Appendix A.2: "1×1 convolution with LN to reduce dimension to 256
+        # and then a 3×3 convolution also with LN"
+        # Strictly follows ViTDet — FPN operates at 256 channels internally.
+        self.fpn_dim = 256
+        self.proj = nn.ModuleList([nn.Conv2d(C, self.fpn_dim, kernel_size=1) for _ in range(4)])
+        self.proj_norm = nn.ModuleList([nn.LayerNorm(self.fpn_dim) for _ in range(4)])
+        self.smooth = nn.ModuleList([nn.Conv2d(self.fpn_dim, self.fpn_dim, kernel_size=3, padding=1) for _ in range(4)])
+        self.smooth_norm = nn.ModuleList([nn.LayerNorm(self.fpn_dim) for _ in range(4)])
 
     def forward(self, feat_map):
         """
@@ -305,7 +305,6 @@ def extract_roi_features_fpn(pyramid, bboxes, levels, H_patches, W_patches,
         padding:     float, fractional bbox padding (same as aligned path)
     Returns:
         roi_features: [B, N, P*P, D]
-        roi_mask:     None (no padding, FlashAttention enabled)
     """
     B, N, _ = bboxes.shape
     D = pyramid[0].shape[1]
@@ -350,7 +349,7 @@ def extract_roi_features_fpn(pyramid, bboxes, levels, H_patches, W_patches,
         # Reshape [M, D, P, P] → [M, P*P, D] and scatter into output
         roi_out[b_idx, n_idx] = lvl_out.reshape(-1, D, P * P).permute(0, 2, 1)
 
-    return roi_out.to(dtype), None
+    return roi_out.to(dtype)
 
 
 # ROI Pose Decoder Layer
@@ -383,13 +382,11 @@ class ROIPoseDecoderLayer(nn.Module):
         )
         self.norm3 = nn.LayerNorm(d_model)
 
-    def forward(self, queries, roi_features, roi_mask=None):
+    def forward(self, queries, roi_features):
         """
         Args:
             queries:      [B, N, D]  pose queries (one per detection)
             roi_features: [B, N, roi_len, D]  per-detection ROI spatial features
-            roi_mask:     [B, N, roi_len] bool, True = padding (to be ignored).
-                          None when no padding exists (enables FlashAttention).
 
         Returns:
             queries: [B, N, D] refined pose queries
@@ -405,13 +402,11 @@ class ROIPoseDecoderLayer(nn.Module):
         q2 = self.norm2(queries)
         q_flat = q2.reshape(B * N, 1, D)
         kv_flat = roi_features.reshape(B * N, roi_len, D)
-        mask_flat = roi_mask.reshape(B * N, roi_len) if roi_mask is not None else None
 
         cross_out = self.cross_attn(
             query=q_flat,
             key=kv_flat,
             value=kv_flat,
-            key_padding_mask=mask_flat,
         )[0]  # [B*N, 1, D]
 
         queries = queries + cross_out.reshape(B, N, D)
@@ -465,6 +460,11 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         self.patch_size = patch_size
         self.roi_output_size = roi_output_size  # P where each ROI -> PxP tokens
 
+        # Remove the CLIP projection head (self.proj from parent) — this model only
+        # detects humans (no multi-class), so pred_logits is never used in the loss.
+        # Setting to None removes it from model.parameters() → no optimizer state waste.
+        self.proj = None
+
         # Learnable pose queries that SHARE positional embedding with detection tokens
         # This ensures pose_slot[i] and det_slot[i] have the same "slot identity"
         # so Hungarian matching supervision is consistent across both outputs
@@ -474,17 +474,22 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         # NOTE: We use det_positional_embedding (from parent) instead of separate pose PE
         # This is the KEY fix - pose slot i must share identity with det slot i
 
-        # Learnable 2D positional embedding for fixed-size ROI grid
-        if roi_output_size > 0:
+        # Learnable 2D positional embedding for fixed-size ROI grid (non-FPN path only).
+        # When use_fpn=True this param is never used, so we skip registering it
+        # entirely — avoids a DDP unused-parameter scan every iteration.
+        self.use_fpn = use_fpn
+        if roi_output_size > 0 and not use_fpn:
             self.roi_pos_embed = nn.Parameter(
                 torch.zeros(roi_output_size ** 2, width)
             )
             nn.init.normal_(self.roi_pos_embed, std=0.02)
 
         # ViTDet FPN neck (optional)
-        self.use_fpn = use_fpn
         if use_fpn:
             self.fpn_neck = ViTDetNeck(in_channels=width)
+            # Project FPN features (256) back to model width (768) after roi_align.
+            # FPN operates at 256 (ViTDet paper); decoder cross-attn needs D=width.
+            self.fpn_roi_proj = nn.Linear(self.fpn_neck.fpn_dim, width)
             # One positional embedding per FPN level (P2/P3/P4/P5 → indices 0/1/2/3)
             # so the decoder can distinguish which scale each ROI came from
             self.fpn_roi_pos_embeds = nn.ParameterList([
@@ -571,16 +576,11 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             det_x = self.dropout(x.reshape(H*W, T, B, C).mean(1)).permute(1, 0, 2)
 
         # --- Detection heads ---
-        if self.proj is not None:
-            class_scores = det_x @ self.proj
-        else:
-            class_scores = det_x
-
         import torch.utils.checkpoint as checkpoint
         bboxes = checkpoint.checkpoint(self.bbox_embed, det_x, use_reentrant=False).sigmoid()
         human_scores = checkpoint.checkpoint(self.human_embed, det_x, use_reentrant=False)
 
-        out = {'pred_logits': class_scores, 'pred_boxes': bboxes, 'human_logits': human_scores}
+        out = {'pred_boxes': bboxes, 'human_logits': human_scores}
 
         # --- ROI extraction ---
         if self.use_fpn:
@@ -594,17 +594,19 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             # Build 4-level pyramid and route each detection to the right level
             pyramid = self.fpn_neck(feat_map)
             levels = assign_fpn_level(
-                bboxes.detach(), H, W, patch_size=self.patch_size
+                bboxes, H, W, patch_size=self.patch_size
             )  # [B, N] in {2,3,4,5}
-            roi_features, roi_mask = extract_roi_features_fpn(
+            roi_features = extract_roi_features_fpn(
                 pyramid=pyramid,
-                bboxes=bboxes.detach(),
+                bboxes=bboxes,
                 levels=levels,
                 H_patches=H,
                 W_patches=W,
                 output_size=self.roi_output_size,
                 padding=0.25,  # larger padding: more robust to imperfect bbox predictions
             )
+            # FPN outputs 256-dim features; project back to D=width for the decoder.
+            roi_features = self.fpn_roi_proj(roi_features)  # [B, N, P*P, 256] → [B, N, P*P, D]
             # Apply level-specific positional embeddings: each detection gets the
             # embedding for its assigned FPN level (levels ∈ {2,3,4,5} → idx {0,1,2,3})
             pos_embed_stack = torch.stack(list(self.fpn_roi_pos_embeds), dim=0)  # [4, P*P, D]
@@ -613,9 +615,9 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             roi_features = roi_features + per_det_embed
             roi_stats = {}
         elif self.roi_output_size > 0:
-            roi_features, roi_mask, roi_stats = extract_roi_features_aligned(
+            roi_features, roi_stats = extract_roi_features_aligned(
                 spatial_features=spatial_features,
-                bboxes=bboxes.detach(),
+                bboxes=bboxes,
                 H_patches=H,
                 W_patches=W,
                 num_frames=T,
@@ -634,32 +636,14 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         pose_queries = self.pose_token + self.det_positional_embedding  # [N, D]
         pose_queries = pose_queries.unsqueeze(0).repeat(B, 1, 1)  # [B, N, D]
 
-        # roi_mask is None for roi_align path → FlashAttention enabled
-        if roi_mask is not None:
-            mask_arg = roi_mask if roi_mask.any() else None
-        else:
-            mask_arg = None
-
-        # Run decoder layers with intermediate supervision
-        aux_outputs = []
+        # Run decoder layers — no intermediate supervision
         for layer in self.pose_decoder_module:
-            pose_queries = layer(pose_queries, roi_features, mask_arg)
-            # Store intermediate outputs for auxiliary losses
-            aux_outputs.append(self._predict_keypoints(
-                self.pose_decoder_ln(pose_queries), bboxes
-            ))
+            pose_queries = layer(pose_queries, roi_features)
 
-        # Final output uses the last aux_output (already computed)
-        final_kp_out = aux_outputs.pop()
-        out['pred_keypoints'] = final_kp_out['pred_keypoints']
-
-        # Attach intermediate outputs for auxiliary losses (all except final)
-        if len(aux_outputs) > 0:
-            out['aux_outputs'] = [
-                {**out_i, 'pred_logits': out['pred_logits'],
-                 'pred_boxes': out['pred_boxes'], 'human_logits': out['human_logits']}
-                for out_i in aux_outputs
-            ]
+        # Apply LayerNorm once to the final decoder output
+        out['pred_keypoints'] = self._predict_keypoints(
+            self.pose_decoder_ln(pose_queries), bboxes
+        )['pred_keypoints']
 
         return out
 
@@ -798,9 +782,7 @@ def interpolate_pos_embed_vit(state_dict, new_model):
 
     return state_dict
 
-# ============================================================================
-# Wrapper class
-# ============================================================================
+
 
 class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
     """
@@ -816,8 +798,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
     def __init__(self,
                  size='l',
                  pretrain=os.path.join(os.path.dirname(os.path.abspath(__file__)), "ViClip-InternVid-10M-FLT.pth"),
-                 det_token_num=100,
-                 num_frames=9,
+                 det_token_num=20,
+                 num_frames=1,
                  num_keypoints=17,
                  decoder_layers=3,
                  roi_output_size=14,
@@ -837,7 +819,7 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
         self.vision_encoder_center = True
         self.video_input_num_frames = num_frames
         self.vision_encoder_drop_path_rate = 0
-        self.vision_encoder_checkpoint_num = 24
+        self.vision_encoder_checkpoint_num = 0
         self.is_pretrain = pretrain
         self.vision_width = 1024
         self.embed_dim = 768

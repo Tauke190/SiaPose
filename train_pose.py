@@ -6,6 +6,7 @@ import os
 import argparse
 import json
 import math
+import time
 import numpy as np
 import sys
 from pathlib import Path
@@ -311,15 +312,6 @@ def build_criterion(args, rank):
         'loss_human': args.W_HUMAN,
     }
 
-    # Add auxiliary loss weights for intermediate decoder layers
-    # Only include keypoint losses (not detection), since detection uses reused predictions
-    # This prevents triple-counting of detection losses while allowing keypoint refinement
-    num_aux_layers = max(0, args.POSE_LAYERS - 1)
-    for i in range(num_aux_layers):
-        # Only add weights for keypoint-related losses in auxiliary layers
-        weight_dict[f'loss_keypoints_{i}'] = args.W_KP
-        weight_dict[f'loss_keypoint_vis_{i}'] = args.W_KP_VIS
-
     # Heatmap model uses global heatmap loss instead of per-instance RLE loss
  
     # Main loss computation
@@ -417,47 +409,72 @@ def count_parameters(model):
 
 
 def build_optimizer(model, args, criterion=None):
-    """Build optimizer with separate learning rates for backbone and heads."""
+    """Build optimizer with separate learning rates for backbone and heads.
+
+    Positional embeddings (positional_embedding, class_embedding, etc.) are excluded
+    from weight decay via model.no_weight_decay(), following standard ViT/DETR practice.
+    This prevents AdamW from shrinking slot-identity embeddings toward zero.
+    """
+    # Collect parameter names that should not be weight-decayed (positional embeddings etc.)
+    no_decay_names = model.no_weight_decay() if hasattr(model, 'no_weight_decay') else set()
+
+    def is_head(name):
+        return ('pose_decoder' in name or 'keypoint' in name or
+                'led_decoder' in name or 'human_head' in name or
+                'box_head' in name or 'det_token' in name or
+                'det_positional' in name or
+                'pose_decoder_ln' in name or
+                'human_embed' in name or 'bbox_embed' in name or
+                'temporal_positional_embedding' in name or 'ln_post' in name or
+                'heatmap_decoder' in name or
+                'pose_decoder_module' in name or
+                'roi_refine_layers' in name or 'roi_refine_ln' in name or
+                'roi_pos_embed' in name or 'fpn_neck' in name or 'fpn_roi_pos_embed' in name or
+                'det_proj' in name or 'pose_proj' in name or
+                'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name)
+
     if args.FREEZE_BACKBONE:
-        # Backbone frozen — single group of trainable params
-        trainable_params = [p for p in model.parameters() if p.requires_grad]
-        # Add criterion parameters (e.g., log_sigma for RLE loss)
-        if criterion is not None and hasattr(criterion, 'log_sigma'):
-            trainable_params.append(criterion.log_sigma)
-        optimizer = torch.optim.AdamW(trainable_params, lr=args.LR, weight_decay=args.WEIGHT_DECAY)
-    else:
-        # Backbone unfrozen — two param groups with different LRs
-        backbone_params = []
-        head_params = []
+        # Backbone frozen — single group, still respect no_weight_decay
+        decay_params, no_decay_params = [], []
         for name, param in model.named_parameters():
             if not param.requires_grad:
                 continue
-            if ('pose_decoder' in name or 'keypoint' in name or
-                    'led_decoder' in name or 'human_head' in name or
-                    'box_head' in name or 'det_token' in name or
-                    'det_positional' in name or
-                    'pose_decoder_ln' in name or
-                    'human_embed' in name or 'bbox_embed' in name or
-                    'temporal_positional_embedding' in name or 'ln_post' in name or
-                    'heatmap_decoder' in name or
-                    'pose_decoder_module' in name or 'pose_decoder_ln' in name or
-                    'roi_refine_layers' in name or 'roi_refine_ln' in name or
-                    'roi_pos_embed' in name or 'fpn_neck' in name or 'fpn_roi_pos_embed' in name or
-                    'det_proj' in name or 'pose_proj' in name or
-                    'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name):
-                head_params.append(param)
+            if name in no_decay_names:
+                no_decay_params.append(param)
             else:
-                backbone_params.append(param)
-
-        # Add criterion parameters (e.g., log_sigma for RLE loss) to head_params
+                decay_params.append(param)
+        # Add criterion parameters (e.g., log_sigma for RLE loss)
         if criterion is not None and hasattr(criterion, 'log_sigma'):
-            head_params.append(criterion.log_sigma)
+            decay_params.append(criterion.log_sigma)
+        param_groups = [
+            {'params': decay_params,    'lr': args.LR, 'weight_decay': args.WEIGHT_DECAY},
+            {'params': no_decay_params, 'lr': args.LR, 'weight_decay': 0.0},
+        ]
+    else:
+        # Backbone unfrozen — 4 groups: (backbone|head) × (decay|no_decay)
+        backbone_decay, backbone_no_decay = [], []
+        head_decay, head_no_decay = [], []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            is_no_decay = name in no_decay_names
+            if is_head(name):
+                (head_no_decay if is_no_decay else head_decay).append(param)
+            else:
+                (backbone_no_decay if is_no_decay else backbone_decay).append(param)
 
-        optimizer = torch.optim.AdamW([
-            {'params': backbone_params, 'lr': args.LR_BACKBONE},
-            {'params': head_params, 'lr': args.LR},
-        ], weight_decay=args.WEIGHT_DECAY)
+        # Add criterion parameters (e.g., log_sigma for RLE loss) to head_decay
+        if criterion is not None and hasattr(criterion, 'log_sigma'):
+            head_decay.append(criterion.log_sigma)
 
+        param_groups = [
+            {'params': backbone_decay,    'lr': args.LR_BACKBONE, 'weight_decay': args.WEIGHT_DECAY},
+            {'params': backbone_no_decay, 'lr': args.LR_BACKBONE, 'weight_decay': 0.0},
+            {'params': head_decay,        'lr': args.LR,          'weight_decay': args.WEIGHT_DECAY},
+            {'params': head_no_decay,     'lr': args.LR,          'weight_decay': 0.0},
+        ]
+
+    optimizer = torch.optim.AdamW(param_groups)
     return optimizer
 
 
@@ -901,8 +918,19 @@ def main(args):
 
     # Restore optimizer + scheduler state when continuing a training run
     if _resume_train_ckpt is not None:
-        optimizer.load_state_dict(_resume_train_ckpt['optimizer'])
-        scheduler.load_state_dict(_resume_train_ckpt['scheduler'])
+        saved_groups = len(_resume_train_ckpt['optimizer']['param_groups'])
+        current_groups = len(optimizer.param_groups)
+        if saved_groups != current_groups:
+            if is_main_process():
+                print(
+                    f"  WARNING: checkpoint optimizer has {saved_groups} param groups, "
+                    f"current optimizer has {current_groups}. "
+                    "Skipping optimizer/scheduler restore — starting with fresh optimizer state.",
+                    flush=True,
+                )
+        else:
+            optimizer.load_state_dict(_resume_train_ckpt['optimizer'])
+            scheduler.load_state_dict(_resume_train_ckpt['scheduler'])
         # Move optimizer state tensors to the correct device
         for state in optimizer.state.values():
             for k, v in state.items():
@@ -1053,6 +1081,9 @@ def main(args):
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
 
+        # Track epoch time
+        epoch_start_time = time.time()
+
         # Train
         avg_loss, batch_stats, total_train_det = train_one_epoch(
             model, criterion, weight_dict, train_loader, optimizer, epoch, rank, args,
@@ -1064,8 +1095,15 @@ def main(args):
 
         scheduler.step()
 
+        # Calculate epoch duration
+        epoch_duration = time.time() - epoch_start_time
+        hours = int(epoch_duration // 3600)
+        minutes = int((epoch_duration % 3600) // 60)
+        seconds = epoch_duration % 60
+        time_str = f"{hours}h {minutes}m {seconds:.1f}s" if hours > 0 else f"{minutes}m {seconds:.1f}s"
+
         if is_main_process():
-            print(f"Epoch {epoch}: avg_loss = {avg_loss:.4f}, lr = {scheduler.get_last_lr()[0]:.2e}, train_det: {total_train_det}", flush=True)
+            print(f"Epoch {epoch}: avg_loss = {avg_loss:.4f}, lr = {scheduler.get_last_lr()[0]:.2e}, train_det: {total_train_det}, time: {time_str}", flush=True)
             if batch_stats:
                 print(f"  Batch validations: {len(batch_stats)} checkpoints", flush=True)
 
