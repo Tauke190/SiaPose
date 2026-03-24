@@ -112,28 +112,18 @@ def get_sia_pose_coco_roi_best(size='l',
                         num_keypoints=17,
                         decoder_layers=3,
                         roi_output_size=14,
-                        fusion_layers=None):
+                        use_fpn=False):
     """
-    Get SIA pose model with optimized FPN-style ROI-based pose decoder.
+    Get SIA pose model with ROI-based pose decoder.
 
-    This model uses an optimized ROI decoder variant with:
-    - FPN-style multi-level ROI extraction (when fusion_layers set)
-    - Scale-aware per-detection blending (small bbox -> early ViT layers)
-    - Unified query tokens for detection + pose (perfect alignment)
-    - Self-attention among pose queries (global context)
-    - Cross-attention to per-detection ROI features via roi_align
-    - FlashAttention support (no padding masks)
-
-    Detection tokens stay in encoder -> bboxes.
-    Pose queries cross-attend only to ROI spatial features extracted via FPN routing.
+    ROI features are extracted from the final encoder layer via roi_align,
+    or from a ViTDet-style 4-level feature pyramid when use_fpn=True.
 
     Args:
         roi_output_size: P where each ROI is pooled to PxP tokens via roi_align.
-                         14 = 196 tokens per detection. 0 = fallback to variable-length.
-        fusion_layers: list of ViT block indices to capture as FPN intermediate levels.
-                       E.g. [3,6,9] for ViT-B/16 (4 levels: 3,6,9,final)
-                       or [8,16,20] for ViT-L/24 (4 levels: 8,16,20,final)
-                       Default None = no FPN (single roi_align on final features).
+                         When use_fpn=True, 7 is recommended (49 tokens, efficient with multi-scale).
+                         When use_fpn=False, 14 is default (196 tokens, single-scale).
+        use_fpn:         Enable ViTDet simple FPN (4-level pyramid, better for small/medium persons).
     """
     sia_model = SIA_POSE_SIMPLE_DEC_ROI_BEST(
         size=size,
@@ -143,7 +133,7 @@ def get_sia_pose_coco_roi_best(size='l',
         num_keypoints=num_keypoints,
         decoder_layers=decoder_layers,
         roi_output_size=roi_output_size,
-        fusion_layers=fusion_layers,
+        use_fpn=use_fpn,
     )
     m = {'sia': sia_model}
     return m

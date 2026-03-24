@@ -60,10 +60,8 @@ def parse_args():
                         help="Number of pose decoder layers")
     parser.add_argument("-ROI_SIZE", type=int, default=14,
                         help="ROI output size P (each ROI -> PxP tokens via roi_align). 14=196 tokens, 7=49 tokens. 0=fallback to variable-length")
-    parser.add_argument("-FUSION_LAYERS", type=str, default="",
-                        help="Comma-separated ViT block indices to capture as FPN intermediate levels. "
-                             "E.g. '3,6,9' for ViT-B/16 (4 levels) or '8,16,20' for ViT-L/24 (4 levels). "
-                             "Default '' = no FPN (single roi_align). Recommended: 3,6,9 with ROI_SIZE 14.")
+    parser.add_argument("--USE_FPN", action="store_true",
+                        help="Enable ViTDet simple FPN neck: 4-level pyramid (P2-P5) from final ViT features. Routes each detection to the correct scale level based on bbox area. Use with smaller -ROI_SIZE (e.g., 7) for efficiency.")
     parser.add_argument("--FREEZE_BACKBONE", action="store_true",
                         help="Freeze vision encoder, train only pose heads (use with pretrained weights)")
 
@@ -148,12 +146,6 @@ def parse_args():
                         help="W&B entity/team name")
 
     args = parser.parse_args()
-
-    # Parse fusion layers from comma-separated string
-    args.fusion_layers_list = (
-        [int(x.strip()) for x in args.FUSION_LAYERS.split(',')]
-        if args.FUSION_LAYERS.strip() else []
-    )
 
     # Set default annotation paths (COCO structure only)
     # PoseTrack users must provide explicit -TRAIN_ANN and -VAL_ANN
@@ -259,7 +251,6 @@ def build_model(args, rank):
             roi_output_size=args.ROI_SIZE,
         )['sia']
     elif args.MODEL == 'sia_pose_coco_roi_best':
-        # ROI-based decoder with FPN routing: multi-level roi_align with scale-aware blending
         model = get_sia_pose_coco_roi_best(
             size=size,
             pretrain=pretrain,
@@ -268,7 +259,7 @@ def build_model(args, rank):
             num_keypoints=17,
             decoder_layers=args.POSE_LAYERS,
             roi_output_size=args.ROI_SIZE,
-            fusion_layers=args.fusion_layers_list,
+            use_fpn=args.USE_FPN,
         )['sia']
     elif args.MODEL == 'sia_pose_posetrack':
         # ROI-based decoder: pose queries cross-attend only to ROI features
@@ -363,10 +354,9 @@ def freeze_encoder(model):
             'heatmap_decoder',                                             # heatmap decoder
             'pose_decoder_module', 'pose_decoder_ln',                      # lightweight pose decoder
             'roi_refine_layers', 'roi_refine_ln',                          # ROI refinement
-            'roi_pos_embed',                                               # ROI positional embedding
+            'roi_pos_embed', 'fpn_neck', 'fpn_roi_pos_embed',               # ROI positional embedding / ViTDet FPN
             'det_proj', 'pose_proj',                                       # Token splitting projections
             'stage2_encoder', 'pose_token', 'pose_positional_embedding',   # EOMT model
-            'fpn_layer_norms', 'fpn_scale_centers', 'fpn_log_sigma',       # FPN routing parameters
         ]):
             param.requires_grad = True
             trainable_count += param.numel()
@@ -452,10 +442,9 @@ def build_optimizer(model, args, criterion=None):
                     'heatmap_decoder' in name or
                     'pose_decoder_module' in name or 'pose_decoder_ln' in name or
                     'roi_refine_layers' in name or 'roi_refine_ln' in name or
-                    'roi_pos_embed' in name or
+                    'roi_pos_embed' in name or 'fpn_neck' in name or 'fpn_roi_pos_embed' in name or
                     'det_proj' in name or 'pose_proj' in name or
-                    'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name or
-                    'fpn_layer_norms' in name or 'fpn_scale_centers' in name or 'fpn_log_sigma' in name):
+                    'stage2_encoder' in name or 'pose_token' in name or 'pose_positional_embedding' in name):
                 head_params.append(param)
             else:
                 backbone_params.append(param)
@@ -600,20 +589,6 @@ def train_one_epoch(model, criterion, weight_dict, dataloader, optimizer, epoch,
                     # Warn if sigma grows too large (divergence risk)
                     if sigma_max > 2.0:
                         log_msg += f" [WARNING: High sigma detected]"
-
-                # Console logging for FPN diagnostics (if FPN is enabled)
-                if hasattr(model, '_last_fpn_weights') and model._last_fpn_weights:
-                    fpn_msg = "  FPN routing:"
-                    # Group by level for readability
-                    num_levels = sum(1 for k in model._last_fpn_weights.keys() if 'w_level' in k and k.endswith('_small'))
-                    for li in range(num_levels):
-                        s = model._last_fpn_weights.get(f'fpn/w_level{li}_small', 0.)
-                        m = model._last_fpn_weights.get(f'fpn/w_level{li}_medium', 0.)
-                        l = model._last_fpn_weights.get(f'fpn/w_level{li}_large', 0.)
-                        fpn_msg += f" | L{li}(s:{s:.2f} m:{m:.2f} l:{l:.2f})"
-                    sigma = model._last_fpn_weights.get('fpn/sigma', 0.)
-                    fpn_msg += f" | σ:{sigma:.4f}"
-                    log_msg += "\n" + fpn_msg
 
                 if rank == 0:
                     print(log_msg, flush=True)
@@ -777,7 +752,7 @@ def validate(model, dataloader, postprocess, rank, args, criterion=None, weight_
     coco_stats = {}
     if rank == 0:
         print(f"Validation: {num_images} images, {total_gt} GT persons, {total_det} detections, "
-              f"val_loss: {val_loss:.4f}, mean_oks (small+medium): {mean_oks:.4f} ({num_oks_matched} matched)", flush=True)
+              f"val_loss: {val_loss:.4f}, mean_oks (all sizes): {mean_oks:.4f} ({num_oks_matched} matched)", flush=True)
         # COCO evaluation via pycocotools (PoseTrack uses OKS metric only)
         if not is_posetrack:
             coco_stats = run_coco_eval(args.VAL_ANN, coco_results, sigmas=COCO_SIGMAS)
@@ -873,7 +848,12 @@ def main(args):
         )
 
         if is_full_train_ckpt:
-            model.load_state_dict(_resume_train_ckpt['model'])
+            incompatible = model.load_state_dict(_resume_train_ckpt['model'], strict=False)
+            if is_main_process():
+                if incompatible.missing_keys:
+                    print(f"  Missing keys (will reinit): {incompatible.missing_keys}", flush=True)
+                if incompatible.unexpected_keys:
+                    print(f"  Unexpected keys (ignored): {incompatible.unexpected_keys}", flush=True)
             start_epoch = _resume_train_ckpt['epoch'] + 1
             _resume_best_ap = _resume_train_ckpt.get('best_ap', 0.0)
             if is_main_process():

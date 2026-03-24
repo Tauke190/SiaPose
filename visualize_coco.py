@@ -142,14 +142,12 @@ def build_model(args):
             num_frames=args.num_frames,
             num_keypoints=17,
             decoder_layers=args.pose_layers,
-            max_roi_cap=args.max_roi_cap,
             roi_output_size=args.roi_output_size,
         )['sia']
     else:
         raise ValueError(f"Unknown model type: {args.model}")
 
     return model
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Visualize COCO Pose Predictions vs Ground Truth")
@@ -166,8 +164,6 @@ def parse_args():
                         help="Number of pose decoder layers (must match training)")
     parser.add_argument("--num_frames", type=int, default=1,
                         help="Number of frames for model input")
-    parser.add_argument("--max_roi_cap", type=int, default=0,
-                        help="Maximum ROI capacity (legacy)")
     parser.add_argument("--roi_output_size", type=int, default=14,
                         help="ROI output size for spatial pooling")
     parser.add_argument("--data_root", type=str, required=True,

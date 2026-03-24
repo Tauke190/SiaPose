@@ -131,7 +131,6 @@ def extract_roi_features_aligned(spatial_features, bboxes, H_patches, W_patches,
         'roi_max': P * P,
         'roi_median': float(P * P),
         'max_roi_len': P * P,
-        'max_roi_cap': 0,
         'capped_count': 0,
         'padding_waste_pct': 0.0,
         'total_slots': B * N * P * P,
@@ -235,7 +234,6 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
                  num_frames=9,
                  num_keypoints=17,
                  decoder_layers=3,
-                 max_roi_cap=0,
                  roi_output_size=14):
         super(SIA_POSE_SIMPLE_DEC_ROI, self).__init__()
 
@@ -247,7 +245,6 @@ class SIA_POSE_SIMPLE_DEC_ROI(nn.Module):
         self.num_keypoints = num_keypoints
         self.num_frames = num_frames
         self.decoder_layers = decoder_layers
-        self.max_roi_cap = max_roi_cap
         self.roi_output_size = roi_output_size
         self.masking_prob = 0.0
         self._last_roi_stats = {}

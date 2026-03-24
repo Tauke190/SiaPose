@@ -120,8 +120,7 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
 
     This is the core validation logic shared between train_pose.py and val_pose.py.
     
-    NOTE: OKS score is calculated ONLY for small+medium sized objects (area < 9216 px²)
-    to focus on pose estimation performance for smaller people.
+    NOTE: OKS score is calculated for all sized objects (small, medium, and large).
 
     Args:
         model: The pose estimation model (in eval mode)
@@ -143,7 +142,7 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
           - 'num_images': total number of images processed
           - 'total_gt': total ground-truth persons
           - 'total_det': total detected persons
-          - 'mean_oks': mean OKS over matched pairs (SMALL+MEDIUM objects only, area < 9216)
+          - 'mean_oks': mean OKS over matched pairs (all object sizes)
           - 'val_loss': validation loss (if criterion provided)
           - 'inference_time': total inference time in seconds
     """
@@ -259,17 +258,16 @@ def validate_pose(model, dataloader, postprocess, imgsize, num_keypoints=17,
                         )
 
                 # Greedy matching by OKS: preds sorted by score (already sorted from postprocess)
-                # FILTER: Only count OKS for small+medium objects (area < 9216 = 96²)
+                # Count OKS for all object sizes (small, medium, and large)
                 matched_gt = set()
                 for pi in range(num_preds):
                     oks_scores = oks_matrix[pi]
                     order = np.argsort(-oks_scores)
                     for gi in order:
                         if gi not in matched_gt and oks_scores[gi] > 0.0:
-                            # Only accumulate OKS if GT is small+medium (area < 9216)
-                            if gt_areas[gi] <= 9216:
-                                total_oks += oks_scores[gi]
-                                num_oks_matched += 1
+                            # Accumulate OKS for all object sizes
+                            total_oks += oks_scores[gi]
+                            num_oks_matched += 1
                             matched_gt.add(gi)
                             break
 

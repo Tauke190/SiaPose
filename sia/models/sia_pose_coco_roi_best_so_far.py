@@ -10,9 +10,7 @@
 #    ├─ Spatial Positional Embedding: [CLS] + patch positions + temporal positions
 #    ├─ Detection Tokens: learnable [DET] tokens (N tokens, concatenated with patches)
 #    ├─ Transformer Blocks: 12 layers (ViT-B/16) / 24 layers (ViT-L/14)
-#    │  └─ Optional multi-layer fusion: collect intermediate features (fusion_layers)
 #    ├─ Output: spatial_features [B, H*W*T, D], det_x [B, N, D]
-#    └─ Feature Fusion (optional): weighted combination of intermediate + final layers
 #
 # 2. DETECTION HEADS
 #    ├─ Input: det_x [B, N, D]
@@ -48,11 +46,15 @@
 #    ├─ Projection: linear [D → 17*256] (per-keypoint hidden feature bottleneck)
 #    ├─ Per-Keypoint Processing:
 #    │  ├─ Query-specific feature: [B, N, 17, 256]
-#    │  ├─ Prediction head: [256 → 3] predicts (x, y, visibility)
-#    │  ├─ Relative Offsets: tanh(-1, 1) normalized relative to bbox center
+#    │  ├─ Prediction head: [256 → 3] predicts (delta_x, delta_y, visibility)
+#    │  ├─ Bbox-initialized absolute coords: sigmoid(logit(bbox_center) + delta)
 #    │  └─ Visibility Score: sigmoid(0, 1) confidence of visibility
-#    ├─ Global Conversion: offset×bbox_size + bbox_center → global (x, y)
 #    └─ Output: keypoints [B, N, 17, 3] (x, y, vis) normalized to [0, 1]
+#
+# Keypoint Decoupling from Bbox:
+#    Keypoints are initialized at bbox_center in logit space, but the network
+#    can freely predict anywhere in [0,1]. This avoids hard-anchoring to an
+#    imperfect bbox while still benefiting from bbox as a warm-start prior.
 #
 # KEY DESIGN PRINCIPLES:
 # ──────────────────────────────────────────────────────────────────────────
@@ -71,11 +73,6 @@
 #   roi_align with fixed output_size (P×P, e.g., 14×14=196 tokens) eliminates
 #   padding waste and enables efficient PyTorch FlashAttention via SDPA.
 #   Variable-length extraction is available (max_roi_cap mode) for compatibility.
-#
-# Multi-Layer Feature Fusion:
-#   Optional feature fusion combines intermediate ViT blocks with final-layer
-#   spatial features (weighted softmax combination). This enriches context with
-#   multi-scale information while maintaining CUDA efficiency.
 #
 # Auxiliary Supervision:
 #   Each pose decoder layer produces keypoint predictions, enabling supervision
@@ -175,6 +172,187 @@ def extract_roi_features_aligned(spatial_features, bboxes, H_patches, W_patches,
     return roi_features, None, {}
 
 
+# ============================================================================
+# ViTDet Simple FPN
+# ============================================================================
+
+class ViTDetNeck(nn.Module):
+    """
+    ViTDet-style simple Feature Pyramid Network (He et al., 2022).
+
+    Strictly follows ViTDet Appendix A.2:
+        P2: 1/4  resolution — deconv → LN → GeLU → deconv
+        P3: 1/8  resolution — one 2×2 deconvolution
+        P4: 1/16 resolution — identity (ViT final feature map)
+        P5: 1/32 resolution — stride-2 2×2 max pooling
+
+    Per-level processing: 1×1 conv → LN → GeLU → 3×3 conv → LN
+    No top-down merging — ViT global self-attention already propagates full context.
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+        C = in_channels
+        # Spatial upsampling for P2 (two chained deconvs) and P3 (one deconv)
+        self.deconv_p3   = nn.ConvTranspose2d(C, C, kernel_size=2, stride=2)
+        self.deconv_p2_a = nn.ConvTranspose2d(C, C, kernel_size=2, stride=2)
+        self.deconv_p2_b = nn.ConvTranspose2d(C, C, kernel_size=2, stride=2)
+        # LN between the two P2 deconvolutions (ViTDet Appendix A.2:
+        # "the first deconvolution is followed by LayerNorm (LN) and GeLU")
+        self.deconv_p2_ln = nn.LayerNorm(C)
+        # Per-level 1×1 projections + LN
+        self.proj = nn.ModuleList([nn.Conv2d(C, C, kernel_size=1) for _ in range(4)])
+        self.proj_norm = nn.ModuleList([nn.LayerNorm(C) for _ in range(4)])
+        # Per-level 3×3 smoothing convolutions + LN
+        # (ViTDet: "1×1 conv with LN ... then a 3×3 conv also with LN")
+        self.smooth = nn.ModuleList([nn.Conv2d(C, C, kernel_size=3, padding=1) for _ in range(4)])
+        self.smooth_norm = nn.ModuleList([nn.LayerNorm(C) for _ in range(4)])
+
+    def forward(self, feat_map):
+        """
+        Args:
+            feat_map: [B, D, H_patches, W_patches]  e.g. [B, 768, 30, 40]
+        Returns:
+            list [P2, P3, P4, P5] each [B, D, H_k, W_k]
+            For ViT-B/16 @ 480×640:
+                P2: [B, 768, 120, 160]
+                P3: [B, 768,  60,  80]
+                P4: [B, 768,  30,  40]
+                P5: [B, 768,  15,  20]
+        """
+        x = feat_map
+
+        # P2: deconv → LN → GeLU → deconv  (strictly per ViTDet Appendix A.2)
+        p2 = self.deconv_p2_a(x)
+        p2 = self.deconv_p2_ln(p2.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+        p2 = F.gelu(p2)
+        p2 = self.deconv_p2_b(p2)
+
+        raw = [
+            p2,                                        # P2: ×4 resolution
+            self.deconv_p3(x),                         # P3: ×2 resolution
+            x,                                         # P4: identity
+            F.max_pool2d(x, kernel_size=2, stride=2),  # P5: ×0.5 resolution
+        ]
+
+        # Per-level: 1×1 conv → LN → GeLU → 3×3 conv → LN  (ViTDet Appendix A.2)
+        out = []
+        for i, f in enumerate(raw):
+            f = self.proj[i](f)
+            f = self.proj_norm[i](f.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            f = F.gelu(f)
+            f = self.smooth[i](f)
+            f = self.smooth_norm[i](f.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+            out.append(f)
+        return out
+
+
+def assign_fpn_level(bboxes_norm, H_patches, W_patches, patch_size=16):
+    """
+    Assign each detection to an FPN pyramid level using the standard FPN rule
+    (Lin et al. 2017, also used in ViTDet He et al. 2022):
+
+        k = clamp( floor(k0 + log2(sqrt(area_pixels) / 56)), k_min=2, k_max=5 )
+
+    k0=4 means P4 (1/16 resolution) is the reference level for 56×56px objects.
+    Returned values {2,3,4,5} map to pyramid list indices {0,1,2,3} via k-2.
+
+    For 480×640 input:
+        Person 32×18px  (~small)  → P2 (1/4 res,  8 feature cells tall)
+        Person 64×36px  (~medium) → P3 (1/8 res,  8 feature cells tall)
+        Person 128×72px (~normal) → P4 (1/16 res, 8 feature cells tall)
+        Person 300×160px (~large) → P5 (1/32 res, ~9 feature cells tall)
+
+    Args:
+        bboxes_norm: [B, N, 4] normalized (cx, cy, w, h) in [0, 1]
+        H_patches:   int, feature map height in patch units (e.g. 30)
+        W_patches:   int, feature map width in patch units  (e.g. 40)
+        patch_size:  int, ViT patch size in pixels (16 for ViT-B/16, 14 for ViT-L/14)
+    Returns:
+        levels: [B, N] int64, values in {2, 3, 4, 5}
+    """
+    bw_px = bboxes_norm[:, :, 2] * (W_patches * patch_size)
+    bh_px = bboxes_norm[:, :, 3] * (H_patches * patch_size)
+    area_px = (bw_px * bh_px).clamp(min=1e-6)
+    # k0=4: standard ViTDet/FPN formula (Lin et al. 2017, He et al. 2022)
+    # P4 (1/16 res) is the reference level for 56×56px objects.
+    k = 4.0 + torch.log2(torch.sqrt(area_px) / 56.0)
+    return k.floor().long().clamp(2, 5)  # [B, N] in {2,3,4,5}
+
+
+def extract_roi_features_fpn(pyramid, bboxes, levels, H_patches, W_patches,
+                              output_size=7, padding=0.1):
+    """
+    Extract fixed-size ROI features from a 4-level ViTDet feature pyramid.
+
+    For each detection, roi_align is called against the pyramid level assigned
+    by assign_fpn_level(). One roi_align call per level; results are scattered
+    back into a [B, N, P², D] output tensor preserving original detection order.
+
+    Bounding boxes are kept in P4 patch-space coordinates. spatial_scale then
+    maps those coordinates to the correct feature-map resolution at each level:
+        P2 (4× upsampled from P4): spatial_scale = 4.0
+        P3 (2× upsampled from P4): spatial_scale = 2.0
+        P4 (base, same as P4):     spatial_scale = 1.0
+        P5 (2× downsampled):       spatial_scale = 0.5
+
+    Args:
+        pyramid:     list [P2, P3, P4, P5], each [B, D, H_k, W_k]
+        bboxes:      [B, N, 4] predicted boxes (cx, cy, w, h) normalized
+        levels:      [B, N] int64 from assign_fpn_level, values in {2,3,4,5}
+        H_patches:   int, P4 spatial height (number of patch rows)
+        W_patches:   int, P4 spatial width  (number of patch columns)
+        output_size: int P — each ROI pooled to P×P tokens
+        padding:     float, fractional bbox padding (same as aligned path)
+    Returns:
+        roi_features: [B, N, P*P, D]
+        roi_mask:     None (no padding, FlashAttention enabled)
+    """
+    B, N, _ = bboxes.shape
+    D = pyramid[0].shape[1]
+    P = output_size
+    device = bboxes.device
+    dtype = pyramid[0].dtype
+
+    spatial_scales = {2: 4.0, 3: 2.0, 4: 1.0, 5: 0.5}
+
+    # Convert normalized bboxes → P4 patch-space (x1, y1, x2, y2)
+    # Same coordinate conversion as extract_roi_features_aligned
+    cx = bboxes[:, :, 0]
+    cy = bboxes[:, :, 1]
+    bw = bboxes[:, :, 2] * (1 + 2 * padding)
+    bh = bboxes[:, :, 3] * (1 + 2 * padding)
+    x1 = ((cx - bw / 2) * W_patches).clamp(min=0)
+    y1 = ((cy - bh / 2) * H_patches).clamp(min=0)
+    x2 = ((cx + bw / 2) * W_patches).clamp(max=W_patches)
+    y2 = ((cy + bh / 2) * H_patches).clamp(max=H_patches)
+    boxes_ps = torch.stack([x1, y1, x2, y2], dim=-1)  # [B, N, 4] in patch-space
+
+    roi_out = torch.zeros(B, N, P * P, D, device=device, dtype=torch.float32)
+
+    for lvl_idx, lvl in enumerate([2, 3, 4, 5]):
+        mask = (levels == lvl)
+        if not mask.any():
+            continue
+        b_idx, n_idx = mask.nonzero(as_tuple=True)  # [M] each
+        rois = torch.cat([
+            b_idx.float().unsqueeze(1),
+            boxes_ps[b_idx, n_idx].float(),
+        ], dim=1)  # [M, 5]
+
+        lvl_out = roi_align(
+            pyramid[lvl_idx].float(),
+            rois,
+            output_size=(P, P),
+            spatial_scale=spatial_scales[lvl],
+            aligned=True,
+        )  # [M, D, P, P]
+
+        # Reshape [M, D, P, P] → [M, P*P, D] and scatter into output
+        roi_out[b_idx, n_idx] = lvl_out.reshape(-1, D, P * P).permute(0, 2, 1)
+
+    return roi_out.to(dtype), None
+
+
 # ROI Pose Decoder Layer
 class ROIPoseDecoderLayer(nn.Module):
     """
@@ -262,9 +440,9 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         self, input_resolution, patch_size, width, layers, heads, output_dim=None,
         kernel_size=1, num_frames=9, drop_path=0, checkpoint_num=0, dropout=0.,
         temp_embed=True, det_token_num=100,
-        num_keypoints=17, decoder_layers=3, max_roi_cap=0,
+        num_keypoints=17, decoder_layers=3,
         roi_output_size=14,
-        fusion_layers=None
+        use_fpn=False,
     ):
         # Parent encoder with NO pose handling
         super().__init__(
@@ -285,7 +463,6 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 
         self.num_keypoints = num_keypoints
         self.patch_size = patch_size
-        self.max_roi_cap = max_roi_cap  # legacy, unused when roi_output_size > 0
         self.roi_output_size = roi_output_size  # P where each ROI -> PxP tokens
 
         # Learnable pose queries that SHARE positional embedding with detection tokens
@@ -304,31 +481,18 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
             )
             nn.init.normal_(self.roi_pos_embed, std=0.02)
 
-        # FPN-style multi-level ROI extraction with scale-aware routing
-        # fusion_layers: list of ViT block indices to capture as intermediate FPN levels.
-        # When enabled: runs roi_align per level, then blends ROI features per-detection
-        # based on bbox area (small bbox -> early levels, large bbox -> final level).
-        self.fpn_layers = list(fusion_layers) if fusion_layers else []
-        if self.fpn_layers:
-            for li in self.fpn_layers:
-                assert 0 <= li < layers, \
-                    f"fpn_layers index {li} out of range [0, {layers})"
-            num_fpn_levels_intermediate = len(self.fpn_layers)
-            # Separate LayerNorm per intermediate level: intermediate activations have
-            # different scale/shift than ln_post-normalised final features.
-            self.fpn_layer_norms = nn.ModuleList([
-                nn.LayerNorm(width) for _ in range(num_fpn_levels_intermediate)
+        # ViTDet FPN neck (optional)
+        self.use_fpn = use_fpn
+        if use_fpn:
+            self.fpn_neck = ViTDetNeck(in_channels=width)
+            # One positional embedding per FPN level (P2/P3/P4/P5 → indices 0/1/2/3)
+            # so the decoder can distinguish which scale each ROI came from
+            self.fpn_roi_pos_embeds = nn.ParameterList([
+                nn.Parameter(torch.zeros(roi_output_size ** 2, width))
+                for _ in range(4)
             ])
-            # Total FPN levels = intermediates + final layer
-            num_fpn_levels = num_fpn_levels_intermediate + 1
-            import math
-            # Scale centers in sqrt(pixels): evenly log-spaced from 32px to 256px.
-            # These cover small (~2×2 patches) to large persons at 480×640 input.
-            lo = math.log2(32.0)
-            hi = math.log2(256.0)
-            centers_log = torch.linspace(lo, hi, num_fpn_levels)
-            self.fpn_scale_centers = nn.Parameter(2.0 ** centers_log)  # [num_levels]
-            self.fpn_log_sigma = nn.Parameter(torch.tensor(0.75))       # bandwidth (log2 space)
+            for p in self.fpn_roi_pos_embeds:
+                nn.init.normal_(p, std=0.02)
 
         # ROI pose decoder: self-attn + cross-attn(ROI) + FFN per layer
         self.pose_decoder_module = nn.ModuleList([
@@ -394,11 +558,7 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         x = self.ln_pre(x)
         x = x.permute(1, 0, 2)  # BND -> NBD
 
-        if self.fpn_layers:
-            x, intermediates = self.transformer(x, return_layers=set(self.fpn_layers))
-        else:
-            x = self.transformer(x)
-            intermediates = None
+        x = self.transformer(x)
 
         x = self.ln_post(x)
 
@@ -422,25 +582,46 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 
         out = {'pred_logits': class_scores, 'pred_boxes': bboxes, 'human_logits': human_scores}
 
-        # --- ROI extraction (FPN-style) ---
-        # roi_align per level, then scale-aware blend per detection based on bbox area
-        if self.roi_output_size > 0:
-            if self.fpn_layers:
-                roi_features, roi_stats = self._extract_fpn_roi_features(
-                    intermediates, spatial_features, bboxes.detach(), H, W, T
-                )
-                roi_mask = None  # FPN always produces fixed-size ROIs → FlashAttention OK
+        # --- ROI extraction ---
+        if self.use_fpn:
+            # Build 2D feature map from temporal-averaged spatial tokens
+            if T > 1:
+                sf = spatial_features.reshape(B, H * W, T, C).mean(dim=2)  # [B, H*W, D]
             else:
-                # Fallback: single roi_align on final spatial features (no FPN)
-                roi_features, roi_mask, roi_stats = extract_roi_features_aligned(
-                    spatial_features=spatial_features,
-                    bboxes=bboxes.detach(),
-                    H_patches=H,
-                    W_patches=W,
-                    num_frames=T,
-                    output_size=self.roi_output_size,
-                    padding=0.1,
-                )
+                sf = spatial_features  # [B, H*W, D]
+            feat_map = sf.reshape(B, H, W, C).permute(0, 3, 1, 2)  # [B, D, H, W]
+
+            # Build 4-level pyramid and route each detection to the right level
+            pyramid = self.fpn_neck(feat_map)
+            levels = assign_fpn_level(
+                bboxes.detach(), H, W, patch_size=self.patch_size
+            )  # [B, N] in {2,3,4,5}
+            roi_features, roi_mask = extract_roi_features_fpn(
+                pyramid=pyramid,
+                bboxes=bboxes.detach(),
+                levels=levels,
+                H_patches=H,
+                W_patches=W,
+                output_size=self.roi_output_size,
+                padding=0.25,  # larger padding: more robust to imperfect bbox predictions
+            )
+            # Apply level-specific positional embeddings: each detection gets the
+            # embedding for its assigned FPN level (levels ∈ {2,3,4,5} → idx {0,1,2,3})
+            pos_embed_stack = torch.stack(list(self.fpn_roi_pos_embeds), dim=0)  # [4, P*P, D]
+            level_idx = (levels - 2).clamp(0, 3)  # [B, N] → {0,1,2,3}
+            per_det_embed = pos_embed_stack[level_idx]  # [B, N, P*P, D]
+            roi_features = roi_features + per_det_embed
+            roi_stats = {}
+        elif self.roi_output_size > 0:
+            roi_features, roi_mask, roi_stats = extract_roi_features_aligned(
+                spatial_features=spatial_features,
+                bboxes=bboxes.detach(),
+                H_patches=H,
+                W_patches=W,
+                num_frames=T,
+                output_size=self.roi_output_size,
+                padding=0.1,
+            )
             # Add learnable 2D positional embedding to ROI features
             # roi_features: [B, N, P*P, D], roi_pos_embed: [P*P, D]
             roi_features = roi_features + self.roi_pos_embed.unsqueeze(0).unsqueeze(0)
@@ -483,7 +664,17 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         return out
 
     def _predict_keypoints(self, pose_x, bboxes):
-        """Predict keypoints as bbox-relative offsets, then convert to global coords."""
+        """
+        Predict keypoints using bbox as a soft prior initialization, not a hard anchor.
+
+        Instead of: kp = bbox_center + offset * bbox_size  (fully bbox-anchored)
+        We use:      kp = sigmoid(bbox_center + learned_delta)  (bbox-initialized but free)
+
+        This decouples the final keypoint position from bbox accuracy:
+        - The bbox center still provides a good initialization (faster convergence)
+        - But the network can predict keypoints outside the bbox if needed
+        - A bad bbox shifts the initialization, but the network can correct it
+        """
         B_kp, num_det, D = pose_x.shape
 
         # Project to per-keypoint hidden features: [B, N, D] → [B, N, 17*256]
@@ -495,129 +686,21 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
         kp_out = self.keypoint_head(kp_flat)  # [B*N*17, 3]
         kp_out = kp_out.reshape(B_kp, num_det, self.num_keypoints, 3)
 
-        # Split into xy (offsets) and visibility
-        keypoints_offset = kp_out[..., :2].tanh()  # [-1, 1] relative offsets
         keypoints_vis = kp_out[..., 2:3].sigmoid()
 
-        keypoints_offset = keypoints_offset.reshape(B_kp, num_det, self.num_keypoints, 2)
-        keypoints_vis = keypoints_vis.reshape(B_kp, num_det, self.num_keypoints, 1)
-
-        # Convert relative offsets to global coordinates: kp = bbox_center + offset * bbox_size
-        bbox_center = bboxes[:, :, :2].unsqueeze(2)  # [B, N, 1, 2] (cx, cy)
-        bbox_size = bboxes[:, :, 2:].unsqueeze(2)    # [B, N, 1, 2] (w, h)
-        keypoints_xy = (bbox_center + keypoints_offset * bbox_size).clamp(0, 1)
+        # Bbox-initialized absolute prediction:
+        # Use bbox center as reference point in logit space, add learned delta.
+        # sigmoid(logit(cx) + delta_x) keeps prediction near bbox center at init
+        # but allows free movement across the full image unlike tanh*bbox_size.
+        bbox_center = bboxes[:, :, :2].unsqueeze(2)  # [B, N, 1, 2], values in (0,1)
+        # Convert bbox center to logit space as initialization anchor
+        bbox_center_clamped = bbox_center.clamp(1e-4, 1 - 1e-4)
+        bbox_logit = torch.log(bbox_center_clamped / (1 - bbox_center_clamped))
+        # Add predicted delta in logit space, then sigmoid back to [0,1]
+        keypoints_xy = (bbox_logit + kp_out[..., :2]).sigmoid()
 
         pred_keypoints = torch.cat([keypoints_xy, keypoints_vis], dim=-1)
         return {'pred_keypoints': pred_keypoints}
-
-    def _extract_fpn_roi_features(self, intermediates, spatial_features, bboxes, H, W, T):
-        """
-        FPN-style ROI extraction: run roi_align independently on each ViT level,
-        then blend per-detection using scale-aware Gaussian weights.
-
-        Small persons (few patches) receive high weight on early levels that
-        preserve local texture; large persons weight final semantic features more.
-
-        Args:
-            intermediates: dict[int -> Tensor[N_tok, B, D]] or None
-            spatial_features: [B, H*W*T, D]  final-layer spatial tokens (ln_post applied)
-            bboxes:          [B, N_det, 4]   detached predicted boxes (cx,cy,w,h) normalized
-            H, W:            int  patch grid dimensions
-            T:               int  number of temporal frames
-
-        Returns:
-            roi_features: [B, N_det, P², D]
-            roi_stats:    dict (same schema as extract_roi_features_aligned)
-        """
-        # --- Build ordered feature map list: [level0, level1, ..., final] ---
-        feat_maps = []
-        if intermediates is not None:
-            for i, layer_idx in enumerate(self.fpn_layers):
-                if self.det_token_num > 0:
-                    inter_sp = intermediates[layer_idx][:-self.det_token_num].permute(1, 0, 2)
-                else:
-                    inter_sp = intermediates[layer_idx].permute(1, 0, 2)
-                feat_maps.append(self.fpn_layer_norms[i](inter_sp))  # [B, H*W*T, D]
-        feat_maps.append(spatial_features)  # final level always last
-
-        num_levels = len(feat_maps)
-        assert num_levels <= len(self.fpn_scale_centers), (
-            f"FPN routing: num_levels={num_levels} > len(fpn_scale_centers)="
-            f"{len(self.fpn_scale_centers)}. Reinitialize model with matching fpn_layers."
-        )
-
-        # --- Scale-aware per-detection blend weights: [B, N_det, num_levels] ---
-        H_img = float(H * self.patch_size)
-        W_img = float(W * self.patch_size)
-        weights = self._compute_fpn_weights(bboxes, H_img, W_img, num_levels)
-
-
-        # ---- DIAGNOSTIC: log routing by size category ----
-        with torch.no_grad():
-            area = bboxes[..., 2] * bboxes[..., 3]  # normalized area [B, N_det]
-            small  = area < 0.04**2   # ~32px / 480px threshold
-            medium = (area >= 0.04**2) & (area < 0.12**2)
-            large  = area >= 0.12**2
-
-            self._last_fpn_weights = {}  # Initialize fresh dict each forward
-            for li in range(num_levels):
-                w_li = weights[..., li]  # [B, N_det]
-                # Store ALL levels, don't overwrite
-                self._last_fpn_weights[f'fpn/w_level{li}_small']  = w_li[small].mean().item()  if small.any()  else 0.
-                self._last_fpn_weights[f'fpn/w_level{li}_medium'] = w_li[medium].mean().item() if medium.any() else 0.
-                self._last_fpn_weights[f'fpn/w_level{li}_large']  = w_li[large].mean().item()  if large.any()  else 0.
-
-            # Also log FPN learnable parameters
-            self._last_fpn_weights['fpn/sigma'] = self.fpn_log_sigma.detach().cpu().item()
-            for i, center in enumerate(self.fpn_scale_centers):
-                self._last_fpn_weights[f'fpn/scale_center_{i}'] = center.detach().cpu().item()
-        # ---- END DIAGNOSTIC ----
-
-        # --- roi_align per level, memory-efficient weighted accumulation ---
-        # Avoids materializing all levels simultaneously (peak = 2× one level).
-        roi_features = None
-        for li, feat in enumerate(feat_maps):
-            roi_i, _, _ = extract_roi_features_aligned(
-                spatial_features=feat,
-                bboxes=bboxes,
-                H_patches=H,
-                W_patches=W,
-                num_frames=T,
-                output_size=self.roi_output_size,
-                padding=0.1,
-            )  # [B, N_det, P², D]
-            wi = weights[:, :, li].unsqueeze(-1).unsqueeze(-1)  # [B, N_det, 1, 1]
-            roi_features = wi * roi_i if roi_features is None else roi_features + wi * roi_i
-
-        return roi_features, {}
-
-    def _compute_fpn_weights(self, bboxes, H_img, W_img, num_levels):
-        """
-        Per-detection scale weights using a Gaussian in log2(sqrt(area_pixels)) space.
-
-        Maps each detection to a soft assignment across FPN levels:
-          - small bbox  → high weight on early levels (fine-grained texture)
-          - large bbox  → high weight on final level  (semantic features)
-
-        Args:
-            bboxes:     [B, N_det, 4]  normalized (cx, cy, w, h)
-            H_img:      int  image height in pixels (H_patches × patch_size)
-            W_img:      int  image width  in pixels (W_patches × patch_size)
-            num_levels: int  number of FPN levels to produce weights for
-
-        Returns:
-            weights: [B, N_det, num_levels]  summing to 1 along dim=-1
-        """
-        area = (bboxes[..., 2] * W_img) * (bboxes[..., 3] * H_img)   # [B, N_det]
-        sqrt_area = area.clamp(min=1.0).sqrt()
-        log_sqrt = torch.log2(sqrt_area).unsqueeze(-1)                  # [B, N_det, 1]
-
-        centers = self.fpn_scale_centers[:num_levels].clamp(min=1.0)   # [num_levels]
-        log_centers = torch.log2(centers)                               # [num_levels]
-
-        sigma = self.fpn_log_sigma.abs().clamp(min=0.1)
-        neg_sq_dist = -((log_sqrt - log_centers) ** 2) / (2.0 * sigma ** 2)
-        return torch.softmax(neg_sq_dist, dim=-1)                       # [B, N_det, num_levels]
 
 
 # ============================================================================
@@ -627,10 +710,10 @@ class VisionTransformerSimpleDecoderROI(VisionTransformer):
 def clip_joint_b16_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=100,
-    dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
-    roi_output_size=14, fusion_layers=None,
+    dropout=0., num_keypoints=17, decoder_layers=3,
+    roi_output_size=14, use_fpn=False,
 ):
-    """ViT-B/16 with ROI pose decoder and FPN routing."""
+    """ViT-B/16 with ROI pose decoder."""
     model = VisionTransformerSimpleDecoderROI(
         input_resolution=input_resolution, patch_size=16,
         width=768, layers=12, heads=12, output_dim=512,
@@ -638,9 +721,8 @@ def clip_joint_b16_simple_dec_roi(
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
         num_keypoints=num_keypoints, decoder_layers=decoder_layers,
-        max_roi_cap=max_roi_cap,
         roi_output_size=roi_output_size,
-        fusion_layers=fusion_layers,
+        use_fpn=use_fpn,
     )
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-B/16"
@@ -653,10 +735,10 @@ def clip_joint_b16_simple_dec_roi(
 def clip_joint_l14_simple_dec_roi(
     pretrained=False, input_resolution=224, kernel_size=1,
     center=True, num_frames=9, drop_path=0., checkpoint_num=0, det_token_num=20,
-    dropout=0., num_keypoints=17, decoder_layers=3, max_roi_cap=0,
-    roi_output_size=14, fusion_layers=None,
+    dropout=0., num_keypoints=17, decoder_layers=3,
+    roi_output_size=14, use_fpn=False,
 ):
-    """ViT-L/14 with ROI pose decoder and FPN routing."""
+    """ViT-L/14 with ROI pose decoder."""
     model = VisionTransformerSimpleDecoderROI(
         input_resolution=input_resolution, patch_size=14,
         width=1024, layers=24, heads=16, output_dim=768,
@@ -664,9 +746,8 @@ def clip_joint_l14_simple_dec_roi(
         checkpoint_num=checkpoint_num,
         drop_path=drop_path, det_token_num=det_token_num,
         num_keypoints=num_keypoints, decoder_layers=decoder_layers,
-        max_roi_cap=max_roi_cap,
         roi_output_size=roi_output_size,
-        fusion_layers=fusion_layers,
+        use_fpn=use_fpn,
     )
     if pretrained:
         model_name = pretrained if isinstance(pretrained, str) else "ViT-L/14"
@@ -739,9 +820,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                  num_frames=9,
                  num_keypoints=17,
                  decoder_layers=3,
-                 max_roi_cap=0,
                  roi_output_size=14,
-                 fusion_layers=None):
+                 use_fpn=False):
         super(SIA_POSE_SIMPLE_DEC_ROI_BEST, self).__init__()
 
         if size.lower() == 'l':
@@ -766,20 +846,19 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
         self.det_token_num = det_token_num
         self.num_keypoints = num_keypoints
         self.decoder_layers = decoder_layers
-        self.max_roi_cap = max_roi_cap
         self.roi_output_size = roi_output_size
-        self.fpn_layers = list(fusion_layers) if fusion_layers else []  # FPN level indices
-        self._last_fpn_weights = {}  # Initialize for logging
+        self.use_fpn = use_fpn
 
         if self.det_token_num > 0:
             print(f'Type: [DET] regression (DEC-ROI, {decoder_layers} decoder layers)')
         else:
             print(f'Type: [PATCH] regression (DEC-ROI, {decoder_layers} decoder layers)')
 
-        roi_info = f'roi_align {roi_output_size}x{roi_output_size}={roi_output_size**2} tokens' if roi_output_size > 0 else f'variable-len (cap={max_roi_cap})'
+        if use_fpn:
+            roi_info = f'ViTDet FPN {roi_output_size}x{roi_output_size}={roi_output_size**2} tokens/det (4 levels: P2-P5)'
+        elif roi_output_size > 0:
+            roi_info = f'roi_align {roi_output_size}x{roi_output_size}={roi_output_size**2} tokens'
         print(f'Dec-ROI pose: {num_keypoints} keypoints, {decoder_layers} decoder layers, {roi_info}')
-        if self.fpn_layers:
-            print(f'FPN routing: levels {self.fpn_layers} + final layer')
 
         # Build vision encoder
         self.vision_encoder = self.build_vision_encoder()
@@ -818,10 +897,6 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
         else:
             output = self.vision_encoder(image)
 
-        # Propagate FPN weights statistics from vision_encoder to wrapper model for logging
-        if hasattr(self.vision_encoder, '_last_fpn_weights'):
-            self._last_fpn_weights = self.vision_encoder._last_fpn_weights
-
         return output
 
     def build_vision_encoder(self):
@@ -839,9 +914,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                 det_token_num=self.det_token_num,
                 num_keypoints=self.num_keypoints,
                 decoder_layers=self.decoder_layers,
-                max_roi_cap=self.max_roi_cap,
                 roi_output_size=self.roi_output_size,
-                fusion_layers=self.fpn_layers,
+                use_fpn=self.use_fpn,
             )
         elif encoder_name == "vit_b16":
             vision_encoder = clip_joint_b16_simple_dec_roi(
@@ -855,9 +929,8 @@ class SIA_POSE_SIMPLE_DEC_ROI_BEST(nn.Module):
                 det_token_num=self.det_token_num,
                 num_keypoints=self.num_keypoints,
                 decoder_layers=self.decoder_layers,
-                max_roi_cap=self.max_roi_cap,
                 roi_output_size=self.roi_output_size,
-                fusion_layers=self.fpn_layers,
+                use_fpn=self.use_fpn,
             )
         else:
             raise NotImplementedError(f"Not implemented: {encoder_name}")
